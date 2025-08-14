@@ -1,5 +1,5 @@
 """
-NAS100 Asia Killzone to London Backtester
+Asia Killzone to London Backtester
 
 Strategy:
 - Uses Asia session (22:00-04:00 UTC) to identify killzone setups
@@ -65,6 +65,7 @@ def parse_args():
     parser.add_argument("--data-utc-offset", type=int, default=0, help="Hours offset of data timestamps relative to UTC (e.g., -5 for UTC-5, -4 for UTC-4). Used if --data-tz not provided.")
     parser.add_argument("--data-tz", default="", help="IANA timezone of the data timestamps (e.g., America/New_York). If set, overrides --data-utc-offset and handles DST.")
     parser.add_argument("--sizing", choices=["contracts", "cfd"], default=SIZING_MODE, help="Position sizing mode")
+    parser.add_argument("--tick-size", type=float, default=TICK_SIZE, help="Price increment (one tick)")
     parser.add_argument("--tick-value", type=float, default=TICK_VALUE, help="$ per tick (contracts mode)")
     parser.add_argument("--point-value", type=float, default=POINT_VALUE, help="$ per point (CFD mode)")
     parser.add_argument("--risk-pct", type=float, default=RISK_PCT_PER_TRADE, help="Risk percentage per trade")
@@ -86,8 +87,7 @@ def parse_args():
     parser.add_argument("--ambiguous", choices=["worst", "neutral", "best"], default=AMBIGUOUS_POLICY, help="Policy for ambiguous TP/SL bars")
     parser.add_argument("--max-trades", type=int, default=MAX_TRADES_PER_DAY, help="Maximum trades per day")
     parser.add_argument("--cooldown-min", type=int, default=COOLDOWN_MIN, help="Cooldown minutes between trades")
-    parser.add_argument("--early-takeout", choices=["on","off"], default="off", help="Apply the pre-London early-takeout day skip filter")
-    parser.add_argument("--early-window", choices=["pre","kz-to-london"], default="kz-to-london", help="Window used for early-takeout detection")
+    # Early takeout is now core and always enforced (kz-to-london); no CLI flags
     parser.add_argument("--no-write", action="store_true", help="Skip writing CSV outputs")
     return parser.parse_args()
 
@@ -99,6 +99,8 @@ def parse_args():
 class AsiaKZInfo:
     session_high: float
     session_low: float
+    session_high_time: pd.Timestamp
+    session_low_time: pd.Timestamp
     kz_high: float
     kz_low: float
     high_made_in_kz: bool
@@ -158,12 +160,13 @@ def build_asia_report(df: pd.DataFrame, out_path: str, config):
         sh_t = pd.Timestamp(arr.dt[sh_idx]) if sh_idx is not None else pd.NaT
         sl_t = pd.Timestamp(arr.dt[sl_idx]) if sl_idx is not None else pd.NaT
 
-        # KZ in current day (00:00–02:00 UTC)
+        # KZ in current day (config.kz_start–config.kz_end in current day window)
         kz0, kz1 = win_idx(arr.mins, i0, i1, _m(config.kz_start), _m(config.kz_end))
         if kz0 is None or kz1 is None or kz0 >= kz1:
             kh = kl = float("nan")
             kh_t = kl_t = pd.NaT
             high_in_kz = low_in_kz = False
+            early_indicator = ""
         else:
             kz_hi = arr.hi[kz0:kz1]
             kz_lo = arr.lo[kz0:kz1]
@@ -176,6 +179,33 @@ def build_asia_report(df: pd.DataFrame, out_path: str, config):
             high_in_kz = (sh_idx is not None) and (kz0 <= sh_idx < kz1)
             low_in_kz  = (sl_idx is not None) and (kz0 <= sl_idx < kz1)
 
+            # Early takeout indicator (kz-to-london): 1 if NOT taken out, 0 if taken out
+            # Only applicable when a high or low was made in KZ; else leave blank
+            if high_in_kz or low_in_kz:
+                early = False
+                london_start_min = _m(config.london_start)
+                slices = []
+                # Slice 1: current day tail from KZ end index to end of current day
+                if kz1 is not None and i1 is not None and kz1 < i1:
+                    slices.append((kz1, i1))
+                # Slice 2: next day head from 00:00 to London start
+                if k + 1 < n_days:
+                    ni0, ni1 = arr.starts[k+1], arr.ends[k+1]
+                    nw0, nw1 = win_idx(arr.mins, ni0, ni1, 0, london_start_min)
+                    if nw0 is not None and nw1 is not None and nw0 < nw1:
+                        slices.append((nw0, nw1))
+                if slices:
+                    if high_in_kz:
+                        if any(np.any(arr.hi[s0:s1] >= kh) for s0, s1 in slices):
+                            early = True
+                    if low_in_kz:
+                        if any(np.any(arr.lo[s0:s1] <= kl) for s0, s1 in slices):
+                            early = True
+                # Map to requested labels: kz(1) = no early takeout, kz(0) = early takeout occurred
+                early_indicator = "kz(0)" if early else "kz(1)"
+            else:
+                early_indicator = ""
+
         rows.append({
             "date": pd.Timestamp(arr.u_days[k]),
             "session_high": float(sh_val), "session_high_time": sh_t,
@@ -184,15 +214,46 @@ def build_asia_report(df: pd.DataFrame, out_path: str, config):
             "kz_low":  kl, "kz_low_time":  kl_t,
             "high_made_in_kz": high_in_kz,
             "low_made_in_kz":  low_in_kz,
+            "early_takeout": early_indicator,
         })
 
     rep = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[
         "date","session_high","session_high_time","session_low","session_low_time",
         "kz_high","kz_high_time","kz_low","kz_low_time","high_made_in_kz","low_made_in_kz"
     ])
-    for col in ("date","session_high_time","session_low_time","kz_high_time","kz_low_time"):
-        rep[col] = pd.to_datetime(rep[col]).dt.strftime("%Y-%m-%d %H:%M:%S%z")
-    rep.to_csv(out_path, index=False)
+    # Build a formatted report per the requested schema
+    fmt = pd.DataFrame()
+    # day as MM-DD Ddd (no year)
+    fmt["day"] = pd.to_datetime(rep["date"]).dt.strftime("%m-%d %a")
+    # times HH:MM
+    for col, outcol in (
+        ("session_high_time","session_high_time"),
+        ("session_low_time","session_low_time"),
+        ("kz_high_time","kz_high_time"),
+        ("kz_low_time","kz_low_time"),
+    ):
+        fmt[outcol] = pd.to_datetime(rep[col]).dt.strftime("%H:%M").fillna("")
+    # prices to 7 decimals
+    def fmt7(s: pd.Series) -> pd.Series:
+        return s.astype(float).map(lambda x: f"{x:.7f}")
+    fmt["session_high"] = fmt7(rep["session_high"]) 
+    fmt["session_low"] = fmt7(rep["session_low"]) 
+    fmt["kz_high"] = fmt7(rep["kz_high"]) 
+    fmt["kz_low"] = fmt7(rep["kz_low"]) 
+    # keep flags for reference at the end
+    fmt["high_made_in_kz"] = rep["high_made_in_kz"].astype(bool)
+    fmt["low_made_in_kz"] = rep["low_made_in_kz"].astype(bool)
+    # early takeout indicator: "1" (no early), "0" (early), or blank
+    if "early_takeout" in rep.columns:
+        fmt["early_takeout"] = rep["early_takeout"].astype(str).replace({"nan": ""})
+    fmt.to_csv(out_path, index=False)
+    # Ensure any previous pretty text is removed
+    try:
+        pretty_path = os.path.splitext(out_path)[0] + ".pretty.txt"
+        if os.path.exists(pretty_path):
+            os.remove(pretty_path)
+    except Exception:
+        pass
 
 def analyze_asia_session_arr(arr: Arr, asia_prev: Tuple[Optional[int], Optional[int]], asia_curr: Tuple[Optional[int], Optional[int]], config=None) -> Optional[AsiaKZInfo]:
     """Array-based Asia session analysis over prev[22-24] + curr[0-4] and KZ [0-2] within curr.
@@ -232,6 +293,8 @@ def analyze_asia_session_arr(arr: Arr, asia_prev: Tuple[Optional[int], Optional[
 
     session_high = float(sh_val)
     session_low = float(sl_val)
+    session_high_time = pd.Timestamp(arr.dt[sh_idx]) if sh_idx is not None else pd.NaT
+    session_low_time = pd.Timestamp(arr.dt[sl_idx]) if sl_idx is not None else pd.NaT
 
     # KZ window can be in prev or current, depending on config times
     def _m(hhmm: str) -> int:
@@ -270,6 +333,8 @@ def analyze_asia_session_arr(arr: Arr, asia_prev: Tuple[Optional[int], Optional[
     return AsiaKZInfo(
         session_high=session_high,
         session_low=session_low,
+    session_high_time=session_high_time,
+    session_low_time=session_low_time,
         kz_high=kz_high,
         kz_low=kz_low,
         high_made_in_kz=bool(high_made_in_kz),
@@ -406,6 +471,7 @@ class Trade:
     side: str
     session: str
     day: pd.Timestamp
+    entry_signal_time: pd.Timestamp
     entry_time: pd.Timestamp
     entry_price: float
     stop_price: float
@@ -419,6 +485,20 @@ class Trade:
     risk_target_usd: float
     risk_allocated_usd: float
     per_unit_risk_usd: float
+    # New debug/diagnostic fields
+    target_fill: float
+    stop_fill: float
+    debug_hit_tp: bool
+    debug_hit_sl: bool
+    # Asia/KZ context for reporting
+    session_high: float
+    session_low: float
+    session_high_time: pd.Timestamp
+    session_low_time: pd.Timestamp
+    kz_high: float
+    kz_low: float
+    kz_high_time: pd.Timestamp
+    kz_low_time: pd.Timestamp
 
 
 def _round_to_tick(x: float) -> float:
@@ -632,11 +712,12 @@ def iter_trading_days_arr(arr: Arr, config):
         }   
 
 def determine_trade_entries(asia_info: AsiaKZInfo, takeouts: list[Tuple[str, pd.Timestamp, int]],
-                           arr: Arr, t0: int, t1: int, p0: Optional[int], p1: Optional[int], config) -> list[dict]:
-    """Determine trade entries based on Asia KZ analysis with KZ levels as targets"""
+                           arr: Arr, e0: int, e1: int, p0: Optional[int], p1: Optional[int], config) -> list[dict]:
+    """Determine trade entries based on Asia KZ analysis with KZ levels as targets.
+    Entry search is restricted to the London window [e0,e1)."""
     trades = []
     
-    if asia_info is None or t0 is None or t1 is None or t0 >= t1:
+    if asia_info is None or e0 is None or e1 is None or e0 >= e1:
         return trades
     
     # Get pre-London range
@@ -682,17 +763,17 @@ def determine_trade_entries(asia_info: AsiaKZInfo, takeouts: list[Tuple[str, pd.
         # Looking to go long towards a target above pre-London high
         if config.entry_mode == "break":
             # Enter on first close above pre-London high
-            m = arr.cl[t0:t1] > pre_hi
+            m = arr.cl[e0:e1] > pre_hi
             idx = np.flatnonzero(m)
             if idx.size:
-                entry_candidates.append(t0 + int(idx[0]))
+                entry_candidates.append(e0 + int(idx[0]))
         elif config.entry_mode == "retest":
             # First find the break, then wait for retest
-            m = arr.cl[t0:t1] > pre_hi
+            m = arr.cl[e0:e1] > pre_hi
             idx = np.flatnonzero(m)
             if idx.size:
-                br = t0 + int(idx[0])
-                m2 = arr.lo[br+1:t1] <= pre_hi
+                br = e0 + int(idx[0])
+                m2 = arr.lo[br+1:e1] <= pre_hi
                 idx2 = np.flatnonzero(m2)
                 if idx2.size:
                     entry_candidates.append(br + 1 + int(idx2[0]))
@@ -701,17 +782,17 @@ def determine_trade_entries(asia_info: AsiaKZInfo, takeouts: list[Tuple[str, pd.
         # Looking to go short towards a target below pre-London low
         if config.entry_mode == "break":
             # Enter on first close below pre-London low
-            m = arr.cl[t0:t1] < pre_lo
+            m = arr.cl[e0:e1] < pre_lo
             idx = np.flatnonzero(m)
             if idx.size:
-                entry_candidates.append(t0 + int(idx[0]))
+                entry_candidates.append(e0 + int(idx[0]))
         elif config.entry_mode == "retest":
             # First find the break, then wait for retest
-            m = arr.cl[t0:t1] < pre_lo
+            m = arr.cl[e0:e1] < pre_lo
             idx = np.flatnonzero(m)
             if idx.size:
-                br = t0 + int(idx[0])
-                m2 = arr.hi[br+1:t1] >= pre_lo
+                br = e0 + int(idx[0])
+                m2 = arr.hi[br+1:e1] >= pre_lo
                 idx2 = np.flatnonzero(m2)
                 if idx2.size:
                     entry_candidates.append(br + 1 + int(idx2[0]))
@@ -720,22 +801,21 @@ def determine_trade_entries(asia_info: AsiaKZInfo, takeouts: list[Tuple[str, pd.
     for entry_idx in entry_candidates[:config.max_trades]:  # Limit entries per day
         entry_time = pd.Timestamp(arr.dt[entry_idx])
         entry_price = float(arr.cl[entry_idx])  # Enter based on close break
-        
+
         # Calculate stop based on RR ratio
         risk_points = abs(target_price - entry_price) / config.rr_ratio
-        
+
         if target_direction == "LONG":
             stop_price = entry_price - risk_points
         else:
             stop_price = entry_price + risk_points
-            
-        stop_price = _round_to_tick(stop_price)
-        target_price_rounded = _round_to_tick(target_price)
-        
+        # Use the exact KZ level as target (no tick rounding) to match the report
+        target_price_exact = float(target_price)
+
         trades.append({
             'entry_time': entry_time,
             'entry_price': entry_price,
-            'target_price': target_price_rounded,
+            'target_price': target_price_exact,
             'stop_price': stop_price,
             'direction': target_direction,
             'scenario': 'kz_target',
@@ -777,64 +857,57 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
             equity_points.append({"date": day_ts, "equity": equity})
             continue
             
-        # Step 2: Early takeout (optional): if KZ high/low taken out between KZ end and London KZ start, skip day
+        # Step 2: Early takeout (core): if KZ high/low taken out between KZ end and London start, skip day
         early = False
-        if config.early_takeout == "on":
-            # Build an early window: from end of KZ (in its segment) to London KZ start (01:00) of current day
-            def _m(hhmm: str) -> int:
-                h, m = map(int, hhmm.split(":"))
-                return h * 60 + m
-            kz_end_min = _m(config.kz_end)
-            london_kz_start_min = _m(config.london_start)
+        # Build an early window: from end of KZ to London start (01:00) of current day (wrap-aware)
+        def _m(hhmm: str) -> int:
+            h, m = map(int, hhmm.split(":"))
+            return h * 60 + m
+        kz_end_min = _m(config.kz_end)
+        london_kz_start_min = _m(config.london_start)
 
-            # Determine where KZ lived (prev or curr) by checking times
-            a_prev0, a_prev1 = a_prev
-            a_curr0, a_curr1 = a_curr
-            kz_seg = None  # ('prev' or 'curr')
-            if a_curr0 is not None and a_curr1 is not None:
-                k0, k1 = win_idx(arr.mins, a_curr0, a_curr1, _m(config.kz_start), kz_end_min)
-                if k0 is not None and k1 is not None and k0 < k1:
-                    kz_seg = ('curr', k0, k1)
-            if kz_seg is None and a_prev0 is not None and a_prev1 is not None:
-                k0, k1 = win_idx(arr.mins, a_prev0, a_prev1, _m(config.kz_start), kz_end_min)
-                if k0 is not None and k1 is not None and k0 < k1:
-                    kz_seg = ('prev', k0, k1)
+        # Determine where KZ lived (prev or curr) by checking times
+        a_prev0, a_prev1 = a_prev
+        a_curr0, a_curr1 = a_curr
+        kz_seg = None  # ('prev' or 'curr')
+        if a_curr0 is not None and a_curr1 is not None:
+            k0, k1 = win_idx(arr.mins, a_curr0, a_curr1, _m(config.kz_start), kz_end_min)
+            if k0 is not None and k1 is not None and k0 < k1:
+                kz_seg = ('curr', k0, k1)
+        if kz_seg is None and a_prev0 is not None and a_prev1 is not None:
+            k0, k1 = win_idx(arr.mins, a_prev0, a_prev1, _m(config.kz_start), kz_end_min)
+            if k0 is not None and k1 is not None and k0 < k1:
+                kz_seg = ('prev', k0, k1)
 
-            # Early window slices
-            slices = []
-            if config.early_window == 'pre':
-                # Use pre-London window exactly
-                if p0 is not None and p1 is not None and p0 < p1:
-                    slices.append((p0, p1))
+        # Early window slices (kz-to-london only)
+        slices = []
+        if kz_seg is not None:
+            seg, k0, k1 = kz_seg
+            kz_end_idx = k1
+            if seg == 'curr':
+                # From kz_end_idx to london_kz_start in current day
+                ci0, ci1 = day_data['range']
+                w0, w1 = win_idx(arr.mins, ci0, ci1, kz_end_min, london_kz_start_min)
+                if w0 is not None and w1 is not None and w0 < w1:
+                    slices.append((w0, w1))
             else:
-                # kz-to-london: KZ end → London KZ start (wrap-aware)
-                if kz_seg is not None:
-                    seg, k0, k1 = kz_seg
-                    kz_end_idx = k1
-                    if seg == 'curr':
-                        # From kz_end_idx to london_kz_start in current day
-                        ci0, ci1 = day_data['range']
-                        w0, w1 = win_idx(arr.mins, ci0, ci1, kz_end_min, london_kz_start_min)
-                        if w0 is not None and w1 is not None and w0 < w1:
-                            slices.append((w0, w1))
-                    else:
-                        # KZ in prev day: from k1 to end of prev Asia window, plus from start of curr day to london_kz_start
-                        ap0, ap1 = a_prev
-                        if ap1 is not None and kz_end_idx < ap1:
-                            slices.append((kz_end_idx, ap1))
-                        ci0, ci1 = day_data['range']
-                        w0, w1 = win_idx(arr.mins, ci0, ci1, 0, london_kz_start_min)
-                        if w0 is not None and w1 is not None and w0 < w1:
-                            slices.append((w0, w1))
+                # KZ in prev day: from k1 to end of prev Asia window, plus from start of curr day to london_kz_start
+                ap0, ap1 = a_prev
+                if ap1 is not None and kz_end_idx < ap1:
+                    slices.append((kz_end_idx, ap1))
+                ci0, ci1 = day_data['range']
+                w0, w1 = win_idx(arr.mins, ci0, ci1, 0, london_kz_start_min)
+                if w0 is not None and w1 is not None and w0 < w1:
+                    slices.append((w0, w1))
 
-            # Check takeout across slices
-            if slices:
-                if asia_info.high_made_in_kz:
-                    if any(np.any(arr.hi[s0:s1] >= asia_info.kz_high) for s0, s1 in slices):
-                        early = True
-                if asia_info.low_made_in_kz:
-                    if any(np.any(arr.lo[s0:s1] <= asia_info.kz_low) for s0, s1 in slices):
-                        early = True
+        # Check takeout across slices
+        if slices:
+            if asia_info.high_made_in_kz:
+                if any(np.any(arr.hi[s0:s1] >= asia_info.kz_high) for s0, s1 in slices):
+                    early = True
+            if asia_info.low_made_in_kz:
+                if any(np.any(arr.lo[s0:s1] <= asia_info.kz_low) for s0, s1 in slices):
+                    early = True
         if early:
             days_early_takeout += 1
             equity_points.append({"date": day_ts, "equity": equity})
@@ -848,15 +921,16 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
             
         # Step 4: Monitor takeout window for KZ level breaches
         takeouts = monitor_takeouts_arr(arr, t0, t1, asia_info)
-        
+
         # Step 5: Determine trade entries based on scenario (KZ levels as targets)
-        potential_trades = determine_trade_entries(asia_info, takeouts, arr, t0, t1, p0, p1, config)
-        
+        # Restrict entry search to the London window [l0,l1)
+        potential_trades = determine_trade_entries(asia_info, takeouts, arr, l0, l1, p0, p1, config)
+
         if not potential_trades:
             days_no_setups += 1
             equity_points.append({"date": day_ts, "equity": equity})
             continue
-        
+
         # Step 6: Execute trades with realistic execution and re-entry limits
         day_trades = 0
         last_exit_time = None
@@ -880,15 +954,23 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
             # Realistic execution: fill at next bar's open
             entry_fill = fill_next_open(entry_idx, arr.op, trade_setup['entry_price'])
 
-            # Recalculate stop/target based on actual fill (maintain RR ratio)
+            # Set TP at the KZ level; compute SL from RR w.r.t. that target
+            base_target = float(trade_setup['target_price'])  # Exact KZ level from setup
+            rr = float(config.rr_ratio) if float(config.rr_ratio) > 0 else 1.0
+            # Keep target as exact KZ level; compute 1R from exact distance
+            target_fill = float(base_target)
+            dist_to_target = abs(target_fill - entry_fill)
+            # 1R is purely based on price distance; don't snap to a global tick (FX has fine increments)
+            one_r_points = max(1e-12, dist_to_target / rr)
             if direction == "LONG":
-                risk_points = abs(target_price - entry_fill) / config.rr_ratio
-                stop_fill = entry_fill - risk_points
+                stop_fill   = float(entry_fill - one_r_points)
             else:
-                risk_points = abs(target_price - entry_fill) / config.rr_ratio
-                stop_fill = entry_fill + risk_points
+                stop_fill   = float(entry_fill + one_r_points)
 
-            stop_fill = _round_to_tick(stop_fill)
+            # Orientation sanity: only take trades moving toward target
+            if (direction == "LONG" and entry_fill >= target_fill) or (direction == "SHORT" and entry_fill <= target_fill):
+                # Already beyond/at the target; invalid orientation
+                continue
 
             # Calculate position size using risk-first approach
             qty = compute_qty(entry_fill, stop_fill, equity, config.risk_pct,
@@ -924,34 +1006,22 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
                 exit_price = float(arr.cl[t1-1])
                 exit_reason = "EOD"
             else:
-                # Search for TP/SL hits in remaining bars
+                # Search for TP/SL hits using recomputed levels
                 hi_array = arr.hi[r0:t1]
                 lo_array = arr.lo[r0:t1]
                 op_array = arr.op[r0:t1]
 
-                tp_idx = None
-                sl_idx = None
-
+                tp_idx = sl_idx = None
                 if direction == "LONG":
-                    tp_mask = hi_array >= target_price
-                    sl_mask = lo_array <= stop_fill
-
-                    tp_hits = np.flatnonzero(tp_mask)
-                    sl_hits = np.flatnonzero(sl_mask)
-                    if tp_hits.size:
-                        tp_idx = int(tp_hits[0])
-                    if sl_hits.size:
-                        sl_idx = int(sl_hits[0])
-                else:  # SHORT
-                    tp_mask = lo_array <= target_price
-                    sl_mask = hi_array >= stop_fill
-
-                    tp_hits = np.flatnonzero(tp_mask)
-                    sl_hits = np.flatnonzero(sl_mask)
-                    if tp_hits.size:
-                        tp_idx = int(tp_hits[0])
-                    if sl_hits.size:
-                        sl_idx = int(sl_hits[0])
+                    tp_hits = np.flatnonzero(hi_array >= target_fill)
+                    sl_hits = np.flatnonzero(lo_array <= stop_fill)
+                else:
+                    tp_hits = np.flatnonzero(lo_array <= target_fill)
+                    sl_hits = np.flatnonzero(hi_array >= stop_fill)
+                if tp_hits.size:
+                    tp_idx = int(tp_hits[0])
+                if sl_hits.size:
+                    sl_idx = int(sl_hits[0])
 
                 # Resolve ambiguous bars and get exit
                 exit_bar_idx, exit_reason = resolve_ambiguous(tp_idx, sl_idx, config.ambiguous)
@@ -960,19 +1030,13 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
                     actual_exit_idx = r0 + exit_bar_idx
                     exit_time = pd.Timestamp(arr.dt[actual_exit_idx])
 
-                    # Realistic exit fill: next bar's open with slippage on stops
+                    # Realistic exit fill
                     if exit_reason == "TP":
-                        # Fill TP exactly at target (no favorable slippage) to keep RR consistent
-                        exit_price = float(target_price)
+                        # Fill TP exactly at target level
+                        exit_price = float(target_fill)
                     elif exit_reason == "SL":
-                        # Stop fill: worst-of next open vs stop level, plus adverse slippage
-                        open_next = float(fill_next_open(exit_bar_idx, op_array, stop_fill))
-                        if direction == "LONG":
-                            worst = min(open_next, float(stop_fill))
-                            exit_price = worst - (SLIPPAGE_TICKS * TICK_SIZE)
-                        else:  # SHORT
-                            worst = max(open_next, float(stop_fill))
-                            exit_price = worst + (SLIPPAGE_TICKS * TICK_SIZE)
+                        # Fill SL exactly at the stop level
+                        exit_price = float(stop_fill)
                     else:  # NEUTRAL
                         exit_price = float(op_array[exit_bar_idx])
                 else:
@@ -981,31 +1045,47 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
                     exit_price = float(arr.cl[t1-1])
                     exit_reason = "EOD"
 
+            # Sanity: TP/SL labels align with exit price and levels
+            if exit_reason == "TP":
+                if direction == "LONG":
+                    assert exit_price >= target_fill - 1e-9
+                else:
+                    assert exit_price <= target_fill + 1e-9
+            elif exit_reason == "SL":
+                if direction == "LONG":
+                    assert exit_price <= stop_fill + 1e-9
+                else:
+                    assert exit_price >= stop_fill - 1e-9
+
             # Calculate PnL and R-multiple
             pnl_currency = calculate_pnl(entry_fill, exit_price, qty, direction,
                                          config.sizing, TICK_SIZE, TICK_VALUE, POINT_VALUE)
 
-            # Calculate R-multiple (actual return vs risk)
-            risk_points = abs(entry_fill - stop_fill)
-            if risk_points > 0:
-                pnl_points = (exit_price - entry_fill) if direction == "LONG" else (entry_fill - exit_price)
-                r_mult = pnl_points / risk_points
-            else:
-                r_mult = 0.0
+            # Calculate R-multiple using planned 1R distance (keeps TP near RR despite tick rounding)
+            pnl_points  = (exit_price - entry_fill) if direction == "LONG" else (entry_fill - exit_price)
+            risk_points_planned = max(TICK_SIZE, one_r_points)
+            r_mult      = float(pnl_points / risk_points_planned) if risk_points_planned > 0 else 0.0
 
             equity += pnl_currency
             last_exit_time = exit_time
             day_trades += 1
 
             # Create trade record
+            # Record entry_time as the actual fill time (next bar if available)
+            try:
+                entry_time_fill = pd.Timestamp(arr.dt[entry_idx + 1])
+            except Exception:
+                entry_time_fill = entry_time
+
             trade = Trade(
                 side=direction,
                 session="Asia-London",
                 day=day_ts,
-                entry_time=entry_time,
+                entry_signal_time=entry_time,
+                entry_time=entry_time_fill,
                 entry_price=float(entry_fill),
                 stop_price=float(stop_fill),
-                target_price=float(target_price),
+                target_price=float(target_fill),
                 exit_time=exit_time,
                 exit_price=float(exit_price),
                 exit_reason=exit_reason,
@@ -1015,11 +1095,23 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
                 risk_target_usd=float(risk_target_usd),
                 risk_allocated_usd=float(risk_allocated_usd),
                 per_unit_risk_usd=float(per_unit_risk_usd),
+                target_fill=float(target_fill),
+                stop_fill=float(stop_fill),
+                debug_hit_tp=bool(tp_idx is not None),
+                debug_hit_sl=bool(sl_idx is not None),
+                session_high=float(asia_info.session_high),
+                session_low=float(asia_info.session_low),
+                session_high_time=pd.Timestamp(asia_info.session_high_time),
+                session_low_time=pd.Timestamp(asia_info.session_low_time),
+                kz_high=float(asia_info.kz_high),
+                kz_low=float(asia_info.kz_low),
+                kz_high_time=pd.Timestamp(asia_info.kz_high_time),
+                kz_low_time=pd.Timestamp(asia_info.kz_low_time),
             )
             trades.append(trade)
 
-        # Track days that had potential trades
-        if potential_trades:
+        # Track days that actually executed trades
+        if day_trades > 0:
             days_with_trades += 1
 
         equity_points.append({"date": day_ts, "equity": equity})
@@ -1030,11 +1122,31 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
     # Write outputs once
     if not config.no_write and not trades_df.empty:
-        # Format timestamps as UTC strings
-        trades_df_output = trades_df.copy()
-        trades_df_output["entry_time"] = trades_df_output["entry_time"].dt.strftime("%Y-%m-%d %H:%M:%S%z")
-        trades_df_output["exit_time"] = trades_df_output["exit_time"].dt.strftime("%Y-%m-%d %H:%M:%S%z")
-        trades_df_output.to_csv("trades.csv", index=False)
+        # Build a clean, human-friendly trades.csv (no debug columns)
+        out = pd.DataFrame()
+        out["side"] = trades_df["side"].str.lower()
+        out["day"] = pd.to_datetime(trades_df["day"]).dt.strftime("%m-%d %a")
+        out["entry_time"] = pd.to_datetime(trades_df["entry_time"]).dt.strftime("%H:%M")
+        out["exit_time"] = pd.to_datetime(trades_df["exit_time"]).dt.strftime("%H:%M")
+
+        def fmt7(s: pd.Series) -> pd.Series:
+            return s.astype(float).map(lambda x: f"{x:.7f}")
+
+        out["entry_price"] = fmt7(trades_df["entry_price"]) 
+        out["exit_price"] = fmt7(trades_df["exit_price"]) 
+        out["stop_loss"] = fmt7(trades_df["stop_price"]) 
+        out["take_profit"] = fmt7(trades_df["target_price"]) 
+
+        # Show if trade hit TP or SL (blank otherwise)
+        def _result(x: str) -> str:
+            if x == "TP":
+                return "tp"
+            if x == "SL":
+                return "sl"
+            return ""
+        out["result"] = trades_df["exit_reason"].map(_result)
+
+        out.to_csv("trades.csv", index=False)
     if not config.no_write:
         eq_df.to_csv("equity_curve.csv", index=False)
 
@@ -1089,6 +1201,7 @@ if __name__ == "__main__":
             self.engine = args.engine
             self.csv_format = args.csv_format
             self.sizing = args.sizing
+            self.tick_size = args.tick_size
             self.tick_value = args.tick_value
             self.point_value = args.point_value
             self.risk_pct = args.risk_pct
@@ -1113,10 +1226,13 @@ if __name__ == "__main__":
             self.no_write = args.no_write
             self.data_utc_offset = args.data_utc_offset
             self.data_tz = args.data_tz
-            self.early_takeout = args.early_takeout
-            self.early_window = args.early_window
+            # Early takeout is core; always enabled and uses kz-to-london window
     
     config = Config(args)
+    # Override module-level tick/point settings from CLI
+    TICK_SIZE = float(config.tick_size)
+    TICK_VALUE = float(config.tick_value)
+    POINT_VALUE = float(config.point_value)
     # Resolve CSV path and format if needed
     resolved_csv, resolved_fmt = _sniff_csv_format_and_path(config.csv_path, args.csv_format)
     config.csv_path = resolved_csv

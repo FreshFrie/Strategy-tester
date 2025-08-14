@@ -1,3 +1,40 @@
-You got the trade entry time conditions correct.
+# Asia Killzone → London Backtest Strategy (UTC-4 Data)
 
-However, we use the asia killzone not to take trades in, but to set up london session trades. So, the asia session in utc time is 22:00 - 04:00. And the asia killzone would be two hours long. The time for the actual asia killzone is 00:00-02:00. This is a very important time you see. So now we must be able to measure the following according to the csv. If during the 22:00 - 4:00 time frame, the session high or low was made during the 00:00-02:00 asia killzone, we are eligable for a trade only if london has not taked that high or low out before the london killzone which is 06:00-09:00. Now, how it works is like this, if the conditions are met, and the asia killzone has not been taken out and did indeed make a high or low, we enter into a possion with our TP target the KZ high or low. So if we were using a Risk to reward of 1:1 we would be risking the ammount of points it would take for price to get to the killzone price level. Now, as for the next condition which is if the asia KZ makes both the high and low of the asia session, we must wait for one side of the kz to get taken out, and if it gets taken out during the london Killzone, we must wait for 1 hour and then enter a trade in the direction targeting the other side of the killzone.
+## Session Definitions (UTC-4)
+| Session       | Time Range (UTC-4) | Purpose |
+|---------------|-------------------|---------|
+| Asia Prev     | `15:00` – `17:00` | Include prior day’s late Asia data for session extremes |
+| Asia Curr     | `17:00` – `23:00` | Main Asia session for this trading day |
+| Asia Killzone | `19:00` – `21:00` | Key level generation: record high/low and mark if extremes occurred here |
+| Pre-London    | `21:00` – `23:00` | Optional early filter (skip if KZ levels broken too early) |
+| London        | `01:00` – `04:00` | General session window |
+| Takeout       | Configurable (e.g., `01:00` – `08:00`) | Trade execution window |
+
+---
+
+## Key Logic
+
+1. **Asia Session Extremes**  
+   - Combine `Asia Prev` + `Asia Curr` to find **session high** and **session low**.
+   - Mark if the high or low was made **inside** the Asia Killzone.
+
+2. **Bias Selection**  
+   - **Only high in KZ** → Long toward that high.  
+   - **Only low in KZ** → Short toward that low.  
+   - **Both extremes in KZ** → Wait for first takeout in London to decide direction.
+
+3. **Entry Trigger**  
+   - Based on **Pre-London** range:
+     - `break` = enter on first close beyond range.
+     - `retest` = break, then retest, then enter.
+
+4. **Stops & Targets**  
+   - Target = KZ level from bias logic.
+   - Stop = distance from entry to maintain RR ratio (e.g., 1:1.5).
+
+5. **Exit**  
+   - TP, SL, or end of takeout window.
+
+---
+
+Do you want me to also rewrite the config defaults in your script so these UTC-4 times are **locked in** by default? That way there’s no risk of accidentally running the wrong time windows.
