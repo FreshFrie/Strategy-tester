@@ -19,6 +19,7 @@ import argparse
 import time
 import os
 from zoneinfo import ZoneInfo
+import importlib
 
 # =============================
 # ======== CONFIG ============
@@ -87,7 +88,13 @@ def parse_args():
     parser.add_argument("--london-start", default="02:00", help="London session start (HH:MM UTC)")
     parser.add_argument("--london-end", default="04:00", help="London session end (HH:MM UTC)")
     parser.add_argument("--entry-mode", choices=["break", "retest"], default=ENTRY_MODE, help="Entry mode relative to pre-London range")
+    parser.add_argument("--entry-strategy", choices=["baseline","cb_vp","mfvg_s","svwap_sh","iib_c","wtr","mix"], default="baseline",
+                        help="Entry detection strategy used inside London KZ")
     parser.add_argument("--ambiguous", choices=["worst", "neutral", "best"], default=AMBIGUOUS_POLICY, help="Policy for ambiguous TP/SL bars")
+    # Ensemble meta-strategy flags
+    parser.add_argument("--ensemble-mode", choices=["off", "first", "best", "confluence"], default="off",
+                        help="Meta selection: off=legacy, first=mix first-to-fire, best=pick highest score, confluence=agreeing detectors boosted")
+    parser.add_argument("--ensemble-delta", type=int, default=2, help="Bar tolerance for confluence bucketing (±Δ bars)")
     parser.add_argument("--max-trades", type=int, default=MAX_TRADES_PER_DAY, help="Maximum trades per day")
     parser.add_argument("--cooldown-min", type=int, default=COOLDOWN_MIN, help="Cooldown minutes between trades")
     parser.add_argument("--no-write", action="store_true", help="Skip writing CSV outputs")
@@ -771,9 +778,94 @@ def iter_trading_days_arr(arr: Arr, config):
             "range": (i0, i1),
         }   
 
+# === Ensemble helpers ===
+def _clip(x: float, lo: float, hi: float) -> float:
+    return lo if x < lo else hi if x > hi else x
+
+def _meta_features(arr: Arr, idx: int, target_price: float, direction: str, day_ctx: dict, atr_n: int = 14) -> dict:
+    # Compute lightweight, generic features from OHLC at entry
+    i = int(idx)
+    i0 = max(0, i - 2)
+    i1 = min(len(arr.cl), i + 1)
+    rng = float(max(1e-12, np.max(arr.hi[i0:i1]) - np.min(arr.lo[i0:i1])))
+    o, h, l, c = float(arr.op[i]), float(arr.hi[i]), float(arr.lo[i]), float(arr.cl[i])
+    body = abs(c - o)
+    total = max(1e-12, h - l)
+    body_ratio = float(body / total)
+    # ATR (SMA) around idx
+    try:
+        from detectors.common import atr_sma, anchor_avwap_from
+    except Exception:
+        atr_sma = None
+        anchor_avwap_from = None
+    if atr_sma is not None:
+        # Compute on a small window for speed
+        w0 = max(0, i - max(atr_n * 3, 60))
+        atr_local = atr_sma(arr.hi[w0:i+1], arr.lo[w0:i+1], arr.cl[w0:i+1], atr_n)
+        atr = float(atr_local[-1]) if np.isfinite(atr_local[-1]) else float(total)
+    else:
+        atr = float(total)
+    impulse_atr = float(_clip((rng / max(1e-12, atr) - 1.0) / 2.0, 0.0, 1.0))
+    # VWAP slope around entry (optional)
+    vwap_slope_atr = 0.0
+    if anchor_avwap_from is not None and isinstance(day_ctx.get("vwap_anchor"), (int, np.integer)):
+        a0 = int(day_ctx["vwap_anchor"])
+        vwap = anchor_avwap_from(arr.op, arr.hi, arr.lo, arr.cl, start_idx=a0)
+        j0 = max(a0 + 5, i - 3)
+        j1 = min(len(vwap), i + 1)
+        if j1 > j0 + 1:
+            dv = float(vwap[j1 - 1] - vwap[j1 - 5]) if (j1 - 5) >= 0 else float(vwap[j1 - 1] - vwap[j0])
+            vwap_slope_atr = float(_clip(abs(dv) / max(1e-12, atr), 0.0, 1.0))
+    # Wick inward (directional)
+    if direction == "LONG":
+        wick_inward = float(_clip((o - l) / total if total > 0 else 0.0, 0.0, 1.0))
+    else:
+        wick_inward = float(_clip((h - o) / total if total > 0 else 0.0, 0.0, 1.0))
+    # Room to target ratio
+    room_ratio = float(_clip(abs(c - float(target_price)) / max(1e-12, 1.5 * atr), 0.0, 1.0))
+    return {
+        "impulse_atr": impulse_atr,
+        "body_ratio": float(_clip((body_ratio - 0.55) / 0.35, 0.0, 1.0) * 0.35 + 0.55),  # keep original scale in features
+        "pre_compression": np.nan,  # unknown here; detectors can populate
+        "vwap_slope_atr": vwap_slope_atr,
+        "wick_inward": wick_inward,
+        "room_ratio": room_ratio,
+    }
+
+def _meta_score_from_features(f: dict) -> float:
+    # Safe defaults
+    imp = _clip((f.get("impulse_atr", 1.0) - 1.0), 0.0, 2.0) / 2.0
+    # body_ratio passed approximately in [0.55,0.9]; remap to quality 0..1
+    brq = _clip((f.get("body_ratio", 0.6) - 0.55) / 0.35, 0.0, 1.0)
+    pre = 1.0 - _clip((f.get("pre_compression", 0.55) or 0.55) / 0.55, 0.0, 1.0)
+    vwp = _clip(f.get("vwap_slope_atr", 0.0) / 0.15, 0.0, 1.0)
+    wck = _clip(f.get("wick_inward", 0.5), 0.0, 1.0)
+    room = 1.0 - _clip(f.get("room_ratio", 0.5), 0.0, 1.0)
+    w = {"imp":0.25, "br":0.20, "pre":0.15, "vwp":0.15, "wck":0.15, "room":0.10}
+    return (w["imp"]*imp + w["br"]*brq + w["pre"]*pre + w["vwp"]*vwp + w["wck"]*wck + w["room"]*room)
+
+def _group_by_time_and_direction(cands: list, tol: int = 2):
+    from types import SimpleNamespace
+    if not cands:
+        return []
+    cands = sorted(cands, key=lambda x: int(x.get("entry_idx", -1)))
+    buckets = []
+    cur = []
+    for c in cands:
+        if not cur:
+            cur = [c]; continue
+        if (c.get("direction") == cur[0].get("direction") and int(c["entry_idx"]) - int(cur[-1]["entry_idx"]) <= tol):
+            cur.append(c)
+        else:
+            buckets.append(SimpleNamespace(cands=cur))
+            cur = [c]
+    if cur:
+        buckets.append(SimpleNamespace(cands=cur))
+    return buckets
+
 def determine_trade_entries(asia_info: AsiaKZInfo, takeouts: list[Tuple[str, pd.Timestamp, int]],
                            arr: Arr, e0: int, e1: int, p0: Optional[int], p1: Optional[int], config,
-                           early_bias: Optional[str] = None) -> list[dict]:
+                           early_bias: Optional[str] = None, diag: Optional[dict] = None) -> list[dict]:
     """Determine trade entries based on Asia KZ analysis with KZ levels as targets.
     Entry search is restricted to the London window [e0,e1)."""
     trades = []
@@ -783,10 +875,14 @@ def determine_trade_entries(asia_info: AsiaKZInfo, takeouts: list[Tuple[str, pd.
     
     # Get pre-London range
     if p0 is None or p1 is None or p0 >= p1:
+        if diag is not None:
+            diag["reason"] = diag.get("reason", []) + ["no_pre_london"]
         return trades
     pre_lo = float(np.min(arr.lo[p0:p1]))
     pre_hi = float(np.max(arr.hi[p0:p1]))
     if pre_lo == 0.0 and pre_hi == 0.0:
+        if diag is not None:
+            diag["reason"] = diag.get("reason", []) + ["empty_pre_range"]
         return trades  # No valid pre-London range
     
     # Determine target based on KZ extremes
@@ -794,12 +890,19 @@ def determine_trade_entries(asia_info: AsiaKZInfo, takeouts: list[Tuple[str, pd.
     target_direction = None
     
     # Scenario 1: Only one extreme made in KZ (high OR low, not both)
+    # Intent: London session tends to sweep the opposite side of the KZ range.
     if (asia_info.high_made_in_kz and not asia_info.low_made_in_kz):
-        target_price = asia_info.kz_high
-        target_direction = "LONG"  # Target above current levels
+        # KZ formed the session high; look to sweep KZ low → short toward kz_low
+        target_price = asia_info.kz_low
+        target_direction = "SHORT"
+        if diag is not None:
+            diag["scenario"] = "single_side_high_in_kz"
     elif (asia_info.low_made_in_kz and not asia_info.high_made_in_kz):
-        target_price = asia_info.kz_low  
-        target_direction = "SHORT"  # Target below current levels
+        # KZ formed the session low; look to sweep KZ high → long toward kz_high
+        target_price = asia_info.kz_high  
+        target_direction = "LONG"
+        if diag is not None:
+            diag["scenario"] = "single_side_low_in_kz"
     
     # Scenario 2: Both extremes made in KZ - use takeout direction
     elif asia_info.high_made_in_kz and asia_info.low_made_in_kz:
@@ -810,6 +913,8 @@ def determine_trade_entries(asia_info: AsiaKZInfo, takeouts: list[Tuple[str, pd.
         elif takeouts:
             first_takeout_type, _, _ = takeouts[0]
         if first_takeout_type is None:
+            if diag is not None:
+                diag["reason"] = diag.get("reason", []) + ["both_in_kz_no_bias"]
             return trades  # No bias established; skip entries for the day
         if first_takeout_type == "high_takeout":
             target_price = asia_info.kz_low
@@ -817,9 +922,187 @@ def determine_trade_entries(asia_info: AsiaKZInfo, takeouts: list[Tuple[str, pd.
         else:
             target_price = asia_info.kz_high
             target_direction = "LONG"
+        if diag is not None:
+            diag["scenario"] = f"both_in_kz_bias={first_takeout_type}"
     
     if target_price is None or target_direction is None:
+        if diag is not None:
+            diag["reason"] = diag.get("reason", []) + ["no_target"]
         return trades
+    if diag is not None:
+        diag["target_direction"] = target_direction
+
+    # Detector router support
+    def _route(strategy: str, arr: Arr, ctx: dict, params: dict):
+        if strategy in ("baseline", "", None):
+            return []
+        if strategy == "mix":
+            order = ["cb_vp", "mfvg_s", "svwap_sh", "iib_c", "wtr"]
+            picks = []
+            last_idx = -10
+            for s in order:
+                try:
+                    mod = importlib.import_module(f"detectors.entry_{s}")
+                    fn = getattr(mod, f"detect_{s}")
+                    out = fn(arr, ctx, params)
+                    for c in out:
+                        ei = int(c.get("entry_idx", -1))
+                        if ei >= 0 and (ei - last_idx) >= 3:
+                            picks.append(c)
+                            last_idx = ei
+                            if len(picks) >= getattr(config, 'max_trades', 1):
+                                break
+                    if len(picks) >= getattr(config, 'max_trades', 1):
+                        break
+                except Exception:
+                    continue
+            return picks
+        mod = importlib.import_module(f"detectors.entry_{strategy}")
+        fn = getattr(mod, f"detect_{strategy}")
+        return fn(arr, ctx, params)
+
+    # Build context for detectors
+    day_ctx = {
+        "p0": p0, "p1": p1, "l0": e0, "l1": e1,
+        "pre_lo": pre_lo, "pre_hi": pre_hi,
+        "kz_high": float(getattr(asia_info, 'kz_high', np.nan)),
+        "kz_low": float(getattr(asia_info, 'kz_low', np.nan)),
+        "direction": target_direction,
+        # Find ~23:00 anchor for AVWAP within current trading day
+        "vwap_anchor": None,
+    }
+    # Derive vwap anchor from true day range around e0
+    try:
+        day_starts, day_ends = arr.starts, arr.ends
+        _k = int(np.searchsorted(day_starts, e0) - 1)
+        _k = int(np.clip(_k, 0, len(day_starts) - 1))
+        i0, i1 = int(day_starts[_k]), int(day_ends[_k])
+        # compute rel minutes helpers
+        def _m(hhmm: str) -> int:
+            h, m = map(int, hhmm.split(":")); return h*60+m
+        anchor_min = _m(config.asia_curr_start)
+        def rel_m(hhmm: str) -> int:
+            return (_m(hhmm) - anchor_min) % (24*60)
+        # Try 23:00, fallback ±10 minutes
+        v0, _ = win_idx(arr.tmins, i0, i1, rel_m("23:00"), 24*60)
+        if v0 is None:
+            for delta in (10, -10, 20, -20):
+                start_rel = (rel_m("23:00") + delta) % (24*60)
+                v0, _ = win_idx(arr.tmins, i0, i1, start_rel, 24*60)
+                if v0 is not None:
+                    break
+        if v0 is not None:
+            day_ctx["vwap_anchor"] = v0
+    except Exception:
+        pass
+
+    # Ensemble meta-selection
+    ens_mode = getattr(config, "ensemble_mode", "off") or "off"
+    if ens_mode in ("best", "confluence"):
+        base_params = {"atr_n": 14, "k_floor": 1.25}
+        user_params = getattr(config, "detector_params", {}) or {}
+        params = {**base_params, **user_params}
+        methods = ["cb_vp", "mfvg_s", "svwap_sh", "iib_c", "wtr"]
+        all_cands = []
+        if diag is not None:
+            diag["ensemble_mode"] = ens_mode
+            diag["detector_raw"] = {m: 0 for m in methods}
+            diag["detector_accepted"] = {m: 0 for m in methods}
+        for s in methods:
+            try:
+                mod = importlib.import_module(f"detectors.entry_{s}")
+                fn = getattr(mod, f"detect_{s}")
+                out = fn(arr, day_ctx, params)
+                if diag is not None:
+                    diag["detector_raw"][s] = int(len(out) if out is not None else 0)
+                for c in out:
+                    ei = int(c.get("entry_idx", -1))
+                    # Allow both directions if target_direction is not established yet
+                    if e0 <= ei < e1 and (target_direction is None or c.get("direction") == target_direction):
+                        if diag is not None:
+                            diag["detector_accepted"][s] += 1
+                        # Ensure features/score exist
+                        feats = dict(c.get("features", {}))
+                        if not feats:
+                            feats = _meta_features(arr, ei, target_price, target_direction, day_ctx, int(params.get("atr_n",14)))
+                        scr = c.get("score")
+                        if scr is None:
+                            scr = _meta_score_from_features(feats)
+                        c = dict(c)
+                        c["features"] = feats
+                        c["score"] = float(scr)
+                        c.setdefault("note", s)
+                        all_cands.append(c)
+            except Exception:
+                continue
+        if not all_cands:
+            if diag is not None:
+                diag["reason"] = diag.get("reason", []) + ["no_detector_candidates"]
+            return trades
+        buckets = _group_by_time_and_direction(all_cands, tol=int(getattr(config, "ensemble_delta", 2)))
+        best_pick = None
+        for b in buckets:
+            k = len(b.cands)
+            top = max(b.cands, key=lambda x: float(x.get("score", 0.0)))
+            if ens_mode == "confluence" and k >= 2:
+                boost = min(1.0 + 0.15 * (k - 1), 1.40)
+                top = dict(top)
+                top["score"] = float(top["score"]) * boost
+                top["note"] = f"{top.get('note','')}+conf{k}"
+                top["confluence"] = k
+            if (best_pick is None) or (float(top["score"]) > float(best_pick["score"])):
+                best_pick = top
+        if best_pick is not None:
+            e = int(best_pick["entry_idx"])
+            cand_dir = best_pick.get('direction', target_direction)
+            # Candidate-specific target when bias wasn't set
+            cand_target = float(target_price) if target_price is not None else (
+                float(getattr(asia_info, 'kz_high', np.nan)) if cand_dir == 'LONG' else float(getattr(asia_info, 'kz_low', np.nan))
+            )
+            trades.append({
+                'entry_time': pd.Timestamp(arr.dt[e]),
+                'entry_price': float(arr.cl[e]),
+                'target_price': cand_target,
+                'stop_price': float(best_pick.get('stop_price')) if best_pick.get('stop_price') is not None else None,
+                'direction': cand_dir,
+                'scenario': f"ens-{ens_mode}:{best_pick.get('note','')}",
+                'entry_idx': e
+            })
+            if diag is not None:
+                diag["picked"] = best_pick.get('note','')
+                diag["picked_idx"] = e
+            return trades
+
+    if getattr(config, "entry_strategy", "baseline") != "baseline":
+        # Merge default params with any provided detector params
+        base_params = {"atr_n": 14, "k_floor": 1.25}
+        user_params = getattr(config, "detector_params", {}) or {}
+        params = {**base_params, **user_params}
+        try:
+            cands = _route(config.entry_strategy, arr, day_ctx, params)
+        except Exception:
+            cands = []
+        if diag is not None:
+            diag["ensemble_mode"] = "off"
+            diag["detector_raw"] = {config.entry_strategy: int(len(cands))}
+            diag["detector_accepted"] = {config.entry_strategy: 0}
+        for c in cands[:config.max_trades]:
+            if c.get("direction") != target_direction:
+                continue
+            entry_idx = int(c["entry_idx"])
+            if diag is not None:
+                diag["detector_accepted"][config.entry_strategy] += 1
+            trades.append({
+                'entry_time': pd.Timestamp(arr.dt[entry_idx]),
+                'entry_price': float(arr.cl[entry_idx]),
+                'target_price': float(target_price),
+                'stop_price': float(c['stop_price']) if c.get('stop_price') is not None else None,
+                'direction': target_direction,
+                'scenario': f"det-{config.entry_strategy}",
+                'entry_idx': entry_idx
+            })
+        if trades:
+            return trades
     
     # Find entry trigger based on pre-London range and entry mode
     entry_candidates = []
@@ -867,9 +1150,8 @@ def determine_trade_entries(asia_info: AsiaKZInfo, takeouts: list[Tuple[str, pd.
         entry_time = pd.Timestamp(arr.dt[entry_idx])
         entry_price = float(arr.cl[entry_idx])  # Enter based on close break
 
-        # Calculate stop based on RR ratio
+        # Calculate stop based on RR ratio (baseline). Detectors may override later in execution.
         risk_points = abs(target_price - entry_price) / config.rr_ratio
-
         if target_direction == "LONG":
             stop_price = entry_price - risk_points
         else:
@@ -886,7 +1168,7 @@ def determine_trade_entries(asia_info: AsiaKZInfo, takeouts: list[Tuple[str, pd.
             'scenario': 'kz_target',
             'entry_idx': entry_idx
         })
-            
+
     return trades
 
 def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -894,6 +1176,7 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
     trades: list[Trade] = []
     equity_points = []
     early_dbg_rows: list[dict] = []
+    diag_rows: list[dict] = []
     days_skipped_sizing = 0
     days_no_kz_setup = 0
     days_early_takeout = 0
@@ -908,8 +1191,9 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
         day_count += 1
         if day_count % 500 == 0:  # Reduced progress reporting frequency
             print(f"Processed {day_count} days, {len(trades)} trades, equity: ${equity:,.0f}", flush=True)
-            
+
         day_ts = day_data['day']
+        diag: dict = {"day": pd.Timestamp(day_ts)}
         a_prev = day_data['asia_prev']
         a_curr = day_data['asia_curr']
         p0, p1 = day_data['pre']
@@ -920,9 +1204,13 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
         asia_info = analyze_asia_session_arr(arr, a_prev, a_curr, config)
         if asia_info is None:
             days_no_kz_setup += 1
+            diag["asia_kz"] = False
+            diag["reason"] = ["no_kz_setup"]
+            diag_rows.append(diag)
             equity_points.append({"date": day_ts, "equity": equity})
             continue
-            
+        diag["asia_kz"] = True
+
         # Step 2: Early takeout (core): if KZ high/low taken out between KZ end and London start, skip day
         early = False
         # Build an early window: from end of KZ to London start (01:00) of current day (wrap-aware)
@@ -1059,12 +1347,19 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
         })
         if early:
             days_early_takeout += 1
+            diag["early_skip"] = True
+            diag["early_bias"] = early_bias or ""
+            diag_rows.append(diag)
             equity_points.append({"date": day_ts, "equity": equity})
             continue  # Skip day if early takeout occurred
+        diag["early_skip"] = False
+        diag["early_bias"] = early_bias or ""
 
         # Step 3: Get the takeout window (configurable)
         # Already have t0,t1 from iterator
         if t0 is None or t1 is None or t0 >= t1:
+            diag["reason"] = diag.get("reason", []) + ["no_takeout_window"]
+            diag_rows.append(diag)
             equity_points.append({"date": day_ts, "equity": equity})
             continue
 
@@ -1073,10 +1368,12 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
         # Step 5: Determine trade entries based on scenario (KZ levels as targets)
         # Restrict entry search to the London window [l0,l1)
-        potential_trades = determine_trade_entries(asia_info, takeouts, arr, l0, l1, p0, p1, config, early_bias=early_bias)
+        potential_trades = determine_trade_entries(asia_info, takeouts, arr, l0, l1, p0, p1, config, early_bias=early_bias, diag=diag)
 
         if not potential_trades:
             days_no_setups += 1
+            diag["reason"] = diag.get("reason", []) + ["no_entry_candidates"]
+            diag_rows.append(diag)
             equity_points.append({"date": day_ts, "equity": equity})
             continue
 
@@ -1084,7 +1381,10 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
         day_trades = 0
         last_exit_time = None
 
-        for trade_setup in potential_trades:
+    orient_skips = 0
+    cooldown_skips = 0
+    sizing_skips = 0
+    for trade_setup in potential_trades:
             # Check daily trade limit
             if day_trades >= config.max_trades:
                 break
@@ -1093,6 +1393,7 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
             if last_exit_time is not None:
                 time_since_exit = (trade_setup['entry_time'] - last_exit_time).total_seconds() / 60
                 if time_since_exit < config.cooldown_min:
+                    cooldown_skips += 1
                     continue
 
             entry_idx = trade_setup['entry_idx']
@@ -1103,22 +1404,26 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
             # Realistic execution: fill at next bar's open
             entry_fill = fill_next_open(entry_idx, arr.op, trade_setup['entry_price'])
 
-            # Set TP at the KZ level; compute SL from RR w.r.t. that target
+            # Set TP at the KZ level; compute SL: use detector override if provided, else RR-to-target
             base_target = float(trade_setup['target_price'])  # Exact KZ level from setup
-            rr = float(config.rr_ratio) if float(config.rr_ratio) > 0 else 1.0
-            # Keep target as exact KZ level; compute 1R from exact distance
             target_fill = float(base_target)
-            dist_to_target = abs(target_fill - entry_fill)
-            # 1R is purely based on price distance; don't snap to a global tick (FX has fine increments)
-            one_r_points = max(1e-12, dist_to_target / rr)
-            if direction == "LONG":
-                stop_fill   = _round_to_pip(float(entry_fill - one_r_points))
+            rr = float(config.rr_ratio) if float(config.rr_ratio) > 0 else 1.0
+            provided_stop = trade_setup.get('stop_price')
+            if provided_stop is not None and np.isfinite(provided_stop):
+                stop_fill = _round_to_pip(float(provided_stop))
+                one_r_points = max(TICK_SIZE, abs(entry_fill - stop_fill))
             else:
-                stop_fill   = _round_to_pip(float(entry_fill + one_r_points))
+                dist_to_target = abs(target_fill - entry_fill)
+                one_r_points = max(1e-12, dist_to_target / rr)
+                if direction == "LONG":
+                    stop_fill = _round_to_pip(float(entry_fill - one_r_points))
+                else:
+                    stop_fill = _round_to_pip(float(entry_fill + one_r_points))
 
             # Orientation sanity: only take trades moving toward target
             if (direction == "LONG" and entry_fill >= target_fill) or (direction == "SHORT" and entry_fill <= target_fill):
                 # Already beyond/at the target; invalid orientation
+                orient_skips += 1
                 continue
 
             # Apply costs to entry (half-spread + half-commission each side). Use ALL_IN_COST_PIPS split evenly.
@@ -1139,6 +1444,7 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
             if qty <= 0:
                 days_skipped_sizing += 1
+                sizing_skips += 1
                 continue
 
             # Apply position limits
@@ -1268,6 +1574,16 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
         # Track days that actually executed trades
         if day_trades > 0:
             days_with_trades += 1
+        # Record diagnostics for this day
+        diag["potential_trades"] = int(len(potential_trades))
+        diag["executed_trades"] = int(day_trades)
+        if orient_skips:
+            diag["orientation_skips"] = int(orient_skips)
+        if cooldown_skips:
+            diag["cooldown_skips"] = int(cooldown_skips)
+        if sizing_skips:
+            diag["sizing_skips"] = int(sizing_skips)
+        diag_rows.append(diag)
 
         equity_points.append({"date": day_ts, "equity": equity})
 
@@ -1310,6 +1626,26 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
             pd.DataFrame(early_dbg_rows).to_csv(os.path.join(out_dir, 'early_takeout_debug.csv'), index=False)
         except Exception:
             pass
+        # Write diagnostics
+        try:
+            out_dir = getattr(config, 'out_dir', os.getcwd())
+            # Normalize nested dicts for CSV
+            if diag_rows:
+                norm = []
+                for d in diag_rows:
+                    row = dict(d)
+                    # Flatten lists/dicts
+                    if isinstance(row.get("reason"), list):
+                        row["reason"] = ";".join(row["reason"]) if row["reason"] else ""
+                    for key in ("detector_raw", "detector_accepted"):
+                        if isinstance(row.get(key), dict):
+                            for k2, v2 in row[key].items():
+                                row[f"{key}.{k2}"] = v2
+                            del row[key]
+                    norm.append(row)
+                pd.DataFrame(norm).to_csv(os.path.join(out_dir, 'trade_diagnostics.csv'), index=False)
+        except Exception:
+            pass
 
     # Summary calculations
     if trades_df.empty:
@@ -1347,6 +1683,19 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
     print(f"Days with early takeout: {days_early_takeout}")
     print(f"Days with no setups: {days_no_setups}")
     print(f"Days with trades: {days_with_trades}")
+    # Additional skip reasons summary (best-effort if diagnostics exists)
+    try:
+        if diag_rows:
+            df_diag = pd.DataFrame(diag_rows)
+            def has_reason(s, tag):
+                return s.fillna("").astype(str).str.contains(tag).sum()
+            print("--- Skip reasons ---")
+            print(f"No pre-London: {has_reason(df_diag.get('reason'), 'no_pre_london')}")
+            print(f"Both-in-KZ no bias: {has_reason(df_diag.get('reason'), 'both_in_kz_no_bias')}")
+            print(f"No detector candidates: {has_reason(df_diag.get('reason'), 'no_detector_candidates')}")
+            print(f"No entry candidates: {has_reason(df_diag.get('reason'), 'no_entry_candidates')}")
+    except Exception:
+        pass
 
     return trades_df, eq_df
 
@@ -1381,12 +1730,16 @@ if __name__ == "__main__":
             self.london_start = args.london_start
             self.london_end = args.london_end
             self.entry_mode = args.entry_mode
+            self.entry_strategy = args.entry_strategy
             self.ambiguous = args.ambiguous
             self.max_trades = args.max_trades
             self.cooldown_min = args.cooldown_min
             self.no_write = args.no_write
             self.data_utc_offset = args.data_utc_offset
             self.data_tz = args.data_tz
+            # Ensemble
+            self.ensemble_mode = getattr(args, 'ensemble_mode', 'off')
+            self.ensemble_delta = getattr(args, 'ensemble_delta', 2)
             # Early takeout is core; always enabled and uses kz-to-london window
     
     config = Config(args)

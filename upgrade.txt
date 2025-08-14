@@ -1,10 +1,711 @@
-2) Trading-day bucketing across midnight (Asia spans two dates)
+**Integration notes (from `main.py`)**
 
-Define a “trading day anchor” (e.g., day rolls at 17:00 UTC-4 when Asia Curr begins). Use this day key everywhere (Asia KZ extremes, invalid-day flag, Pre-London, London KZ).
-Otherwise you’ll accidentally:
+* The current entry logic lives in `determine_trade_entries(asia_info, takeouts, arr, e0, e1, p0, p1, config, early_bias=None)` and produces candidate setups that the simulator later executes with **next‑bar open** fills and realistic cost modeling. It already enforces the **invalid‑day** rule via the early‑takeout check (KZ end → London start) and aligns bias to KZ extremes or first takeout when both extremes formed in KZ.&#x20;
+* Session bucketing and windows are array‑indexed via `build_arrays`, `iter_trading_days_arr`, and `win_idx` with the **trading day anchored at `asia_curr_start`**. Pre‑London and London windows passed into `determine_trade_entries` as `(p0, p1)` and `(l0, l1)` already match your updated times (Pre‑London 23:00–02:00, London KZ 02:00–04:00 by defaults).&#x20;
+* The simulator expects each entry to provide `entry_idx`, `entry_time`, `direction`, `target_price`, and `stop_price` (it supports same‑bar TP/SL ambiguity via `resolve_ambiguous`, and models costs with `apply_trading_costs`). We will **extend** `determine_trade_entries` to route to modular detectors and accept per‑detector **stop overrides** while keeping the existing TP-at‑KZ behavior.&#x20;
 
-pull the wrong Asia Prev segment,
+**Ambiguities + shim**
 
-mix levels across calendar days,
+* ATR/VWAP are not precomputed in `main.py`. To keep the patch minimal and avoid heavy changes in the core loop, detectors will compute **OHLC‑only ATR** and **anchored AVWAP (unit‑weighted VWAP)** on the fly from the arrays they receive.
+* CSV timebase: if your EURUSD CSV is already **UTC‑4 local timestamps**, run with `--csv-format mt --data-utc-offset -4` (or `--data-tz America/New_York` if you have DST‑aware strings) so `load_data` produces correct UTC bars.&#x20;
 
-or mis-tag invalid days that tripped on the wrong date container.
+---
+
+type: YAML
+interface\_map:
+detectors\_entrypoint: |
+\# We will route from inside main.py:
+determine\_trade\_entries(asia\_info, takeouts, arr, e0, e1, p0, p1, config, early\_bias=None)
+\# Added via patch:
+\--entry-strategy {baseline,cb\_vp,mfvg\_s,svwap\_sh,iib\_c,wtr,mix}
+route:
+module: detectors.entry\_<strategy>
+function: detect\_<strategy>(arr, day\_ctx, params) -> list\[dict]
+detector\_return:
+\- entry\_idx: int            # index inside \[l0,l1)
+direction: "LONG"|"SHORT" # must match KZ bias computed by core
+stop\_price: float|null    # optional override; if null, core RR stop is used
+note: str                 # optional label for auditing
+session\_tags\_required:
+\- "Anchored trading\_day (arr.u\_days/starts/ends) from asia\_curr\_start."
+\- "Pre-London window \[p0,p1) and range (pre\_lo, pre\_hi)."
+\- "London KZ window \[l0,l1)."
+\- "KZ extremes and flags (asia\_info.kz\_high/low, \*\_made\_in\_kz)."
+\- "Early-takeout result (skip done upstream)."
+\- "On-demand arrays in detectors: ATR(n), anchored AVWAP from 23:00."
+trade\_sim\_hook: |
+The router returns candidate {entry\_idx, direction, stop\_price?}.
+Core builds trade setups exactly like baseline:
+entry\_price := close\[entry\_idx] (signal)
+fill := next-bar open
+target := KZ target chosen by bias rules (unchanged)
+stop := detector.stop\_price if provided else current RR-to-target scheme
+The rest of execution (costs, ambiguity, sizing, exits) remains unchanged.
+
+methods:
+
+* name: CB-VP (Compression→Break→Validated Pullback)
+  hypothesis: |
+  When Pre‑London compresses (range small vs recent ATR), the first London KZ
+  expansion through the Pre‑London boundary that **retests** the broken level
+  within an ATR‑scaled tolerance and reclaims momentum tends to run cleanly
+  toward the KZ target (stop liquidity → expansion → continuation).
+  features:
+  definitions: |
+  Let i be bar index.
+  Pre‑London range: pre\_lo = min(low\[p0\:p1]), pre\_hi = max(high\[p0\:p1]).
+  Body ratio at i: body\_ratio\[i] = |close\[i]-open\[i]| / max(1e-9, high\[i]-low\[i]).
+  True range: TR\[i] = max(high\[i]-low\[i], |high\[i]-close\[i-1]|, |low\[i]-close\[i-1]|).
+  ATR\_n\[i] = SMA(TR, n).
+  Compression factor α\_prelon = (pre\_hi - pre\_lo) / mean(ATR\_n\[p0\:p1]).
+  Break bar (long): close\[i] > pre\_hi and body\_ratio\[i] ≥ γ and
+  (high\[i]-low\[i]) ≥ β·ATR\_n\[i].
+  Retest: exists j∈\[i+1, i+R\_retest] with low\[j] ≤ pre\_hi + ε·ATR\_n\[i] (long).
+  Reclaim trigger: close\[j] > max(close\[j-1], high\[j-1])  (local momentum resume).
+  Short side is symmetric with pre\_lo, inequalities inverted.
+  parameters:
+  atr\_n: \[10, 14, 20]
+  alpha\_prelon\_max: \[0.25, 0.32, 0.40, 0.48, 0.55]
+  beta: \[0.60, 0.80, 1.00, 1.20]         # breakout range vs ATR
+  gamma: \[0.60, 0.70, 0.80]              # body ratio
+  eps\_atr: \[0.00, 0.05, 0.10, 0.15, 0.20]
+  R\_retest: \[2, 3, 4, 5]                  # bars allowed for retest
+  k\_floor: \[1.0, 1.25, 1.5, 1.75]         # SL floor in ATR
+  preconditions:
+
+  * "Valid day (no early AKZ breach before 02:00)."
+  * "Bias fixed by KZ logic; detector must align direction."
+  * "Entry i within 02:00–04:00 London KZ."
+    entry\_rule: |
+    LONG:
+    if α\_prelon ≤ alpha\_prelon\_max and break above pre\_hi at bar i satisfies beta & gamma:
+    wait for retest j within R\_retest s.t. low\[j] ≤ pre\_hi + eps\_atr·ATR\_n\[i]
+    if reclaim condition holds at j: signal entry\_idx = j
+    SHORT is symmetric at pre\_lo.
+    stop\_rule: |
+    SL = max(structural, ATR floor):
+    structural\_long = pre\_hi - δ, δ = 0.1·ATR\_n\[i]
+    ATR\_floor\_long  = entry\_fill - k\_floor·ATR\_n\[i]
+    SL\_long         = min(structural\_long, ATR\_floor\_long)
+    (mirror for short).
+    target\_rule: |
+    TP1 = KZ target chosen by bias rule (unchanged).
+    Optional runner (not required by core): disable by default to keep simulator behavior stable.
+    failure\_modes:
+  * name: Over‑compression fakeouts
+    detector: "α\_prelon << 0.2 and multiple micro breaks without body strength"
+    action: \["skip"]
+  * name: Slippage hazard on micro‑bars
+    detector: "ATR\_n\[i] < 0.5·median(ATR\_n over last 24h)"
+    action: \["skip"]
+
+* name: mFVG-S (Micro FVG Fill + Structure Shift)
+  hypothesis: |
+  A three‑bar micro fair‑value gap during London KZ often acts as an inefficiency.
+  A **partial fill** followed by a shift of short‑term structure in the KZ bias direction
+  typically accelerates toward the KZ target.
+  features:
+  definitions: |
+  Bullish mFVG at m: high\[m-1] < low\[m+1]. Gap size g = low\[m+1] - high\[m-1].
+  Fill threshold f∈\[0.33,0.50,0.66]: valid fill if price trades down to
+  low\[m+1] - f·g before re‑expanding.
+  Structure shift (long): close\[k] > swing\_high\_{lb}\[k-1] where swing highs
+  are fractals over lookback lb (e.g., 3).
+  ATR\_n per CB‑VP definition.
+  Short side inverted (low\[m-1] > high\[m+1], fills upward).
+  parameters:
+  atr\_n: \[10, 14, 20]
+  gap\_min\_atr: \[0.40, 0.60, 0.80, 1.00]    # g ≥ gap\_min\_atr·ATR\_n\[m]
+  fill\_frac: \[0.33, 0.50, 0.66]
+  lb\_fractal: \[2, 3, 4]
+  k\_floor: \[1.0, 1.25, 1.5, 1.75]
+  eps\_atr: \[0.00, 0.05, 0.10]
+  preconditions:
+
+  * "Valid day; bias fixed; entry within 02:00–04:00."
+    entry\_rule: |
+    Identify first mFVG in \[l0,l1). For LONG:
+    require bullish mFVG with g ≥ gap\_min\_atr·ATR\_n\[m]
+    wait for partial fill: low reaches ≥ (low\[m+1] - f·g)
+    then require structure shift: close breaks a recent fractal high
+    → entry at that close index.
+    SHORT symmetric.
+    stop\_rule: |
+    SL\_long = min( gap\_base (high\[m-1]) - 0.1·ATR\_n, entry\_fill - k\_floor·ATR\_n )
+    (mirror for short using gap\_base = low\[m-1]).
+    target\_rule: "TP1 = KZ target (unchanged)."
+    failure\_modes:
+  * name: Phantom gaps in very low ATR
+    detector: "ATR\_n\[m] < small\_threshold and g < tick\*3"
+    action: \["skip"]
+
+* name: sVWAP-SH (Session AVWAP Shift‑and‑Hold)
+  hypothesis: |
+  When London re‑anchors above an anchored VWAP from 23:00 and **holds** with k consecutive closes and a positive slope,
+  pullbacks to the AVWAP within ATR tolerance often continue toward the KZ target.
+  features:
+  definitions: |
+  AVWAP\_{23:00}\[t] = cumulative mean of typical price TP=(H+L+C)/3 starting from the first bar ≥ 23:00 (anchored to trading day).
+  Slope over k\_s: slope = AVWAP\[t] - AVWAP\[t-k\_s].
+  Hold: k\_hold consecutive closes on the same side of AVWAP.
+  Pullback tag (long): low ≤ AVWAP + ε·ATR\_n before resumption (close > prior close).
+  parameters:
+  atr\_n: \[14, 20]
+  k\_hold: \[2, 3, 4]
+  k\_slope: \[5, 10]
+  slope\_min\_atr: \[0.05, 0.10, 0.15]   # relative to ATR\_n
+  eps\_atr: \[0.05, 0.10, 0.15, 0.20]
+  k\_floor: \[1.0, 1.25, 1.5]
+  preconditions:
+
+  * "Valid day; bias fixed; AVWAP anchor found at \~23:00 in day range."
+    entry\_rule: |
+    LONG:
+    require cross & hold: last k\_hold closes > AVWAP and (AVWAP\[t]-AVWAP\[t-k\_s]) ≥ slope\_min\_atr·ATR\_n\[t]
+    wait for pullback within eps\_atr·ATR\_n to AVWAP
+    on resumption close > max(close\[-1], high\[-1]) → signal.
+    SHORT symmetric.
+    stop\_rule: |
+    SL\_long = min( AVWAP - 0.1·ATR\_n, entry\_fill - k\_floor·ATR\_n )
+    SHORT mirrored.
+    target\_rule: "TP1 = KZ target (unchanged)."
+    failure\_modes:
+  * name: Flat AVWAP drift
+    detector: "abs(slope) < slope\_min\_atr·ATR\_n"
+    action: \["skip"]
+
+* name: I→IB-C (Impulse→Inside‑Bar Continuation)
+  hypothesis: |
+  A strong impulse in London KZ often consolidates into an inside bar; breaking the
+  inside bar in impulse direction, aligned with KZ bias, tends to continue cleanly.
+  features:
+  definitions: |
+  Impulse at i: (high\[i]-low\[i]) ≥ β·ATR\_n\[i] and body\_ratio\[i] ≥ γ.
+  Inside bar at i+1: high\[i+1] ≤ high\[i] and low\[i+1] ≥ low\[i].
+  Trigger: break of inside‑bar high (LONG) or low (SHORT).
+  parameters:
+  atr\_n: \[10, 14, 20]
+  beta: \[1.50, 2.00, 2.50, 3.00]
+  gamma: \[0.60, 0.70, 0.80]
+  k\_floor: \[1.0, 1.25, 1.5]
+  eps\_atr: \[0.00, 0.05]
+  preconditions:
+
+  * "Valid day; bias fixed; impulse occurs in \[l0,l1-1)."
+    entry\_rule: |
+    On detecting impulse at i and inside bar at i+1, set entry\_idx = i+1 if its break in direction is confirmed by close.
+    stop\_rule: |
+    SL\_long = min( low\[i] - 0.1·ATR\_n\[i], entry\_fill - k\_floor·ATR\_n\[i] )
+    (mirror for short with high\[i]).
+    target\_rule: "TP1 = KZ target (unchanged)."
+    failure\_modes:
+  * name: Inside bar fake break
+    detector: "trigger bar body\_ratio < 0.3"
+    action: \["skip","reduce\_size"]
+
+* name: WTR (Wick‑Trap Rejection)
+  hypothesis: |
+  A stop‑run beyond Pre‑London extreme that **closes back inside the range** (long wick) followed by an engulf
+  often leads to reversal toward the KZ target (classic liquidity sweep + rejection).
+  features:
+  definitions: |
+  For LONG:
+  Sweep bar s: low\[s] < pre\_lo - ω·ATR\_n\[s] and close\[s] > pre\_lo (close back inside range).
+  Confirmation c: close\[c] > (open\[s] + 0.25·(close\[s]-open\[s])) and close\[c] > high\[c-1].
+  SHORT mirrored at pre\_hi with high wick.
+  Wick ratio: wick\_inward = (close - low)/(high - low) for long case; require wick\_inward ≥ τ.
+  parameters:
+  atr\_n: \[10, 14, 20]
+  omega: \[0.35, 0.45, 0.55, 0.65]   # sweep depth in ATR
+  tau: \[0.55, 0.65, 0.75]           # inward wick ratio
+  k\_floor: \[1.0, 1.25, 1.5, 1.75]
+  eps\_atr: \[0.00, 0.05]
+  preconditions:
+
+  * "Valid day; bias fixed; sweep occurs in \[l0,l1)."
+    entry\_rule: |
+    On detecting sweep s with inward wick and close back inside, wait 1 bar.
+    If confirmation c meets the condition and aligns with bias → entry\_idx = c.
+    stop\_rule: |
+    SL\_long = min( low\[s] - 0.1·ATR\_n\[s], entry\_fill - k\_floor·ATR\_n\[s] )
+    SHORT mirrored.
+    target\_rule: "TP1 = KZ target (unchanged)."
+    failure\_modes:
+  * name: Multiple sweeps (chop)
+    detector: "≥2 sweeps within last 10 bars"
+    action: \["skip"]
+
+code:
+language: python
+files:
+\- path: "detectors/common.py"
+exports: \["atr\_sma", "fractal\_swings", "anchor\_avwap\_from", "body\_ratio"]
+content: |
+import numpy as np
+
+```
+    def _prev_close(cl):
+        pc = np.empty_like(cl)
+        pc[0] = cl[0]
+        pc[1:] = cl[:-1]
+        return pc
+
+    def atr_sma(hi, lo, cl, n=14):
+        pc = _prev_close(cl)
+        tr = np.maximum(hi - lo, np.maximum(np.abs(hi - pc), np.abs(lo - pc)))
+        # Simple moving average ATR; pad with NaN for first n-1
+        atr = np.full_like(tr, np.nan, dtype=float)
+        if n <= 1:
+            atr[:] = tr
+            return atr
+        c = np.convolve(tr, np.ones(n, dtype=float)/n, mode="valid")
+        atr[n-1:] = c
+        return atr
+
+    def body_ratio(op, hi, lo, cl):
+        rng = np.maximum(1e-12, hi - lo)
+        return np.abs(cl - op) / rng
+
+    def fractal_swings(hi, lo, lb=3):
+        # Returns boolean arrays is_pivoth, is_pivotl where a pivot is strict max/min in a 2*lb+1 window
+        n = len(hi)
+        is_h = np.zeros(n, dtype=bool)
+        is_l = np.zeros(n, dtype=bool)
+        for i in range(lb, n-lb):
+            hwin = hi[i-lb:i+lb+1]
+            lwin = lo[i-lb:i+lb+1]
+            if hi[i] == np.max(hwin) and np.sum(hi[i] == hwin) == 1:
+                is_h[i] = True
+            if lo[i] == np.min(lwin) and np.sum(lo[i] == lwin) == 1:
+                is_l[i] = True
+        return is_h, is_l
+
+    def anchor_avwap_from(op, hi, lo, cl, start_idx, end_idx=None):
+        """
+        Unit-weighted anchored VWAP (AVWAP): cumulative mean of TP=(H+L+C)/3 from start_idx.
+        Returns array same length as inputs, filled with np.nan before start_idx.
+        """
+        n = len(cl)
+        tp = (hi + lo + cl) / 3.0
+        out = np.full(n, np.nan, dtype=float)
+        if start_idx is None or start_idx < 0 or start_idx >= n:
+            return out
+        if end_idx is None or end_idx > n:
+            end_idx = n
+        seg = tp[start_idx:end_idx]
+        cum = np.cumsum(seg)
+        denom = np.arange(1, len(seg)+1, dtype=float)
+        avwap_seg = cum / denom
+        out[start_idx:end_idx] = avwap_seg
+        return out
+- path: "detectors/entry_cb_vp.py"
+  exports: ["detect_cb_vp"]
+  content: |
+    import numpy as np
+    from .common import atr_sma, body_ratio
+
+    def detect_cb_vp(arr, day_ctx, params):
+        op, hi, lo, cl = arr.op, arr.hi, arr.lo, arr.cl
+        p0, p1 = day_ctx["p0"], day_ctx["p1"]
+        l0, l1 = day_ctx["l0"], day_ctx["l1"]
+        direction = day_ctx["direction"]
+        pre_lo, pre_hi = day_ctx["pre_lo"], day_ctx["pre_hi"]
+
+        n = int(params.get("atr_n", 14))
+        atr = atr_sma(hi, lo, cl, n)
+        pre_atr_mean = np.nanmean(atr[p0:p1]) if p0 is not None and p1 is not None and p0 < p1 else np.nan
+        if not np.isfinite(pre_atr_mean) or pre_atr_mean <= 0:
+            return []
+
+        alpha_max = float(params.get("alpha_prelon_max", 0.4))
+        comp = (pre_hi - pre_lo) / pre_atr_mean if pre_atr_mean > 0 else np.inf
+        if not (comp <= alpha_max):
+            return []
+
+        beta = float(params.get("beta", 0.8))
+        gamma = float(params.get("gamma", 0.7))
+        eps = float(params.get("eps_atr", 0.1))
+        R_retest = int(params.get("R_retest", 3))
+
+        br = body_ratio(arr.op, hi, lo, cl)
+        out = []
+
+        # scan KZ
+        for i in range(max(l0, 1), l1):  # start at 1 for prev-close access
+            if not np.isfinite(atr[i]):
+                continue
+            rng = hi[i] - lo[i]
+            if rng < beta * atr[i] or br[i] < gamma:
+                continue
+
+            if direction == "LONG":
+                if cl[i] <= pre_hi:
+                    continue
+                # retest window
+                j0, j1 = i+1, min(l1, i+1+R_retest)
+                # nearest retest bar touching broken level within eps*ATR
+                touched = np.flatnonzero(lo[j0:j1] <= pre_hi + eps * atr[i])
+                if touched.size == 0:
+                    continue
+                j = j0 + int(touched[0])
+                # reclaim: simple momentum resume
+                if cl[j] > max(cl[j-1], hi[j-1]):
+                    out.append({"entry_idx": j, "direction": "LONG", "stop_price": None, "note": "cb_vp"})
+            else:
+                if cl[i] >= pre_lo:
+                    continue
+                j0, j1 = i+1, min(l1, i+1+R_retest)
+                touched = np.flatnonzero(hi[j0:j1] >= pre_lo - eps * atr[i])
+                if touched.size == 0:
+                    continue
+                j = j0 + int(touched[0])
+                if cl[j] < min(cl[j-1], lo[j-1]):
+                    out.append({"entry_idx": j, "direction": "SHORT", "stop_price": None, "note": "cb_vp"})
+
+        # optional structural ATR floor stop (let core RR apply if None)
+        k_floor = float(params.get("k_floor", 1.25))
+        if out:
+            # compute stop override per first candidate only (core enforces max_trades_per_day)
+            e = out[0]["entry_idx"]
+            if direction == "LONG":
+                out[0]["stop_price"] = float(cl[e] - k_floor * atr[e]) if np.isfinite(atr[e]) else None
+            else:
+                out[0]["stop_price"] = float(cl[e] + k_floor * atr[e]) if np.isfinite(atr[e]) else None
+        return out
+- path: "detectors/entry_mfvg_s.py"
+  exports: ["detect_mfvg_s"]
+  content: |
+    import numpy as np
+    from .common import atr_sma, fractal_swings
+
+    def detect_mfvg_s(arr, day_ctx, params):
+        hi, lo, cl = arr.hi, arr.lo, arr.cl
+        l0, l1 = day_ctx["l0"], day_ctx["l1"]
+        direction = day_ctx["direction"]
+        n = int(params.get("atr_n", 14))
+        atr = atr_sma(hi, lo, cl, n)
+        gap_min = float(params.get("gap_min_atr", 0.6))
+        f = float(params.get("fill_frac", 0.5))
+        lb = int(params.get("lb_fractal", 3))
+
+        is_h, is_l = fractal_swings(hi, lo, lb)
+        out = []
+
+        for m in range(max(l0+1, 2), l1-1):
+            if direction == "LONG":
+                # bullish mFVG
+                if not (hi[m-1] < lo[m+1]):
+                    continue
+                g = lo[m+1] - hi[m-1]
+                if not (np.isfinite(atr[m]) and g >= gap_min * atr[m]):
+                    continue
+                # fill then shift
+                fill_level = lo[m+1] - f * g
+                # find k ≥ m+1 that traded down to fill_level
+                k0, k1 = m+1, l1
+                # need low ≤ fill_level first
+                touched = np.flatnonzero(lo[k0:k1] <= fill_level)
+                if touched.size == 0:
+                    continue
+                k = k0 + int(touched[0])
+                # structure shift: break any recent fractal high
+                # find last pivot high before k
+                piv_hi_idx = np.flatnonzero(is_h[:k])
+                if piv_hi_idx.size == 0:
+                    continue
+                if cl[k] > hi[piv_hi_idx[-1]]:
+                    out.append({"entry_idx": k, "direction": "LONG", "stop_price": hi[m-1] - 0.1*atr[k], "note": "mfvg_s"})
+            else:
+                # bearish mFVG
+                if not (lo[m-1] > hi[m+1]):
+                    continue
+                g = hi[m+1] - lo[m-1]
+                if not (np.isfinite(atr[m]) and g >= gap_min * atr[m]):
+                    continue
+                fill_level = hi[m+1] + f * g
+                k0, k1 = m+1, l1
+                touched = np.flatnonzero(hi[k0:k1] >= fill_level)
+                if touched.size == 0:
+                    continue
+                k = k0 + int(touched[0])
+                piv_lo_idx = np.flatnonzero(is_l[:k])
+                if piv_lo_idx.size == 0:
+                    continue
+                if cl[k] < lo[piv_lo_idx[-1]]:
+                    out.append({"entry_idx": k, "direction": "SHORT", "stop_price": lo[m-1] + 0.1*atr[k], "note": "mfvg_s"})
+        return out
+- path: "detectors/entry_svwap_sh.py"
+  exports: ["detect_svwap_sh"]
+  content: |
+    import numpy as np
+    from .common import atr_sma, anchor_avwap_from
+
+    def detect_svwap_sh(arr, day_ctx, params):
+        op, hi, lo, cl = arr.op, arr.hi, arr.lo, arr.cl
+        l0, l1 = day_ctx["l0"], day_ctx["l1"]
+        vwap_anchor = day_ctx.get("vwap_anchor")  # may be None
+        direction = day_ctx["direction"]
+
+        n = int(params.get("atr_n", 14))
+        k_hold = int(params.get("k_hold", 3))
+        k_s = int(params.get("k_slope", 10))
+        slope_min = float(params.get("slope_min_atr", 0.1))
+        eps = float(params.get("eps_atr", 0.1))
+
+        atr = atr_sma(hi, lo, cl, n)
+
+        # find AVWAP from anchor (~23:00) limited to this day range
+        if vwap_anchor is None:
+            return []
+        avwap = anchor_avwap_from(op, hi, lo, cl, vwap_anchor, end_idx=l1)
+
+        out = []
+        for t in range(max(l0+k_hold, vwap_anchor+k_s), l1):
+            if not np.isfinite(atr[t]) or not np.isfinite(avwap[t]) or not np.isfinite(avwap[t-k_s]):
+                continue
+            slope_ok = (avwap[t] - avwap[t-k_s]) >= slope_min * atr[t]
+            if direction == "LONG":
+                hold = np.all(cl[t-k_hold+1:t+1] > avwap[t-k_hold+1:t+1])
+                if not (hold and slope_ok):
+                    continue
+                # pullback within eps*ATR before t
+                j0 = max(l0, t-k_hold-6)
+                pulled = np.flatnonzero((lo[j0:t] <= (avwap[j0:t] + eps * atr[j0:t])))
+                if pulled.size == 0:
+                    continue
+                out.append({"entry_idx": t, "direction": "LONG", "stop_price": float(cl[t] - 1.25*atr[t]), "note": "svwap_sh"})
+            else:
+                hold = np.all(cl[t-k_hold+1:t+1] < avwap[t-k_hold+1:t+1])
+                slope_ok = (avwap[t-k_s] - avwap[t]) >= slope_min * atr[t]
+                if not (hold and slope_ok):
+                    continue
+                j0 = max(l0, t-k_hold-6)
+                pulled = np.flatnonzero((hi[j0:t] >= (avwap[j0:t] - eps * atr[j0:t])))
+                if pulled.size == 0:
+                    continue
+                out.append({"entry_idx": t, "direction": "SHORT", "stop_price": float(cl[t] + 1.25*atr[t]), "note": "svwap_sh"})
+        return out
+- path: "detectors/entry_iib_c.py"
+  exports: ["detect_iib_c"]
+  content: |
+    import numpy as np
+    from .common import atr_sma, body_ratio
+
+    def detect_iib_c(arr, day_ctx, params):
+        op, hi, lo, cl = arr.op, arr.hi, arr.lo, arr.cl
+        l0, l1 = day_ctx["l0"], day_ctx["l1"]
+        direction = day_ctx["direction"]
+        n = int(params.get("atr_n", 14))
+        beta = float(params.get("beta", 2.0))
+        gamma = float(params.get("gamma", 0.7))
+        atr = atr_sma(hi, lo, cl, n)
+        br = body_ratio(op, hi, lo, cl)
+
+        out = []
+        for i in range(max(l0+1, 1), min(l1-1, len(cl)-1)):
+            if not np.isfinite(atr[i]):
+                continue
+            if (hi[i]-lo[i]) < beta*atr[i] or br[i] < gamma:
+                continue
+            # inside bar
+            if hi[i+1] <= hi[i] and lo[i+1] >= lo[i]:
+                if direction == "LONG" and cl[i+1] > (hi[i+1] - 1e-12):
+                    out.append({"entry_idx": i+1, "direction": "LONG", "stop_price": float(lo[i] - 0.1*atr[i]), "note": "iib_c"})
+                elif direction == "SHORT" and cl[i+1] < (lo[i+1] + 1e-12):
+                    out.append({"entry_idx": i+1, "direction": "SHORT", "stop_price": float(hi[i] + 0.1*atr[i]), "note": "iib_c"})
+        return out
+- path: "detectors/entry_wtr.py"
+  exports: ["detect_wtr"]
+  content: |
+    import numpy as np
+    from .common import atr_sma
+
+    def detect_wtr(arr, day_ctx, params):
+        op, hi, lo, cl = arr.op, arr.hi, arr.lo, arr.cl
+        l0, l1 = day_ctx["l0"], day_ctx["l1"]
+        direction = day_ctx["direction"]
+        pre_lo, pre_hi = day_ctx["pre_lo"], day_ctx["pre_hi"]
+
+        n = int(params.get("atr_n", 14))
+        omega = float(params.get("omega", 0.55))
+        tau = float(params.get("tau", 0.65))
+        atr = atr_sma(hi, lo, cl, n)
+
+        out = []
+        for s in range(max(l0, 1), l1):
+            if not np.isfinite(atr[s]) or (hi[s]-lo[s]) <= 0:
+                continue
+            if direction == "LONG":
+                # sweep below pre_lo then close back inside
+                if lo[s] < pre_lo - omega*atr[s] and cl[s] > pre_lo:
+                    inward = (cl[s] - lo[s]) / max(1e-12, hi[s]-lo[s])
+                    if inward >= tau and s+1 < l1:
+                        c = s+1
+                        if cl[c] > (op[s] + 0.25*(cl[s]-op[s])) and cl[c] > hi[c-1]:
+                            out.append({"entry_idx": c, "direction": "LONG", "stop_price": float(lo[s] - 0.1*atr[s]), "note": "wtr"})
+            else:
+                if hi[s] > pre_hi + omega*atr[s] and cl[s] < pre_hi:
+                    inward = (hi[s] - cl[s]) / max(1e-12, hi[s]-lo[s])
+                    if inward >= tau and s+1 < l1:
+                        c = s+1
+                        if cl[c] < (op[s] - 0.25*(op[s]-cl[s])) and cl[c] < lo[c-1]:
+                            out.append({"entry_idx": c, "direction": "SHORT", "stop_price": float(hi[s] + 0.1*atr[s]), "note": "wtr"})
+        return out
+- path: "patches/main_py.diff"
+  content: |
+    --- a/main.py
+    +++ b/main.py
+    @@
+     from typing import Tuple, Optional
+     import math
+     import argparse
+     import time
+     import os
+     from zoneinfo import ZoneInfo
+    +import importlib
+    @@ def parse_args():
+         parser.add_argument("--london-end", default="04:00", help="London session end (HH:MM UTC)")
+         parser.add_argument("--entry-mode", choices=["break", "retest"], default=ENTRY_MODE, help="Entry mode relative to pre-London range")
+    +    parser.add_argument("--entry-strategy", choices=["baseline","cb_vp","mfvg_s","svwap_sh","iib_c","wtr","mix"], default="baseline",
+    +                        help="Entry detection strategy used inside London KZ")
+         parser.add_argument("--ambiguous", choices=["worst", "neutral", "best"], default=AMBIGUOUS_POLICY, help="Policy for ambiguous TP/SL bars")
+         parser.add_argument("--max-trades", type=int, default=MAX_TRADES_PER_DAY, help="Maximum trades per day")
+         parser.add_argument("--cooldown-min", type=int, default=COOLDOWN_MIN, help="Cooldown minutes between trades")
+         parser.add_argument("--no-write", action="store_true", help="Skip writing CSV outputs")
+         return parser.parse_args()
+    @@
+         class Config:
+             def __init__(self, args):
+    @@
+                 self.entry_mode = args.entry_mode
+    +            self.entry_strategy = args.entry_strategy
+                 self.ambiguous = args.ambiguous
+    @@
+     def determine_trade_entries(asia_info: AsiaKZInfo, takeouts: list[Tuple[str, pd.Timestamp, int]],
+                                arr: Arr, e0: int, e1: int, p0: Optional[int], p1: Optional[int], config,
+                                early_bias: Optional[str] = None) -> list[dict]:
+    @@
+     def pre_london_range(pre_df: pd.DataFrame) -> Tuple[float, float]:
+    @@
+         pre_lo = float(np.min(arr.lo[p0:p1]))
+         pre_hi = float(np.max(arr.hi[p0:p1]))
+    @@
+    +    # Build day context object for detectors
+    +    def _m(hhmm: str) -> int:
+    +        h, m = map(int, hhmm.split(":")); return h*60+m
+    +    anchor_min = _m(config.asia_curr_start)
+    +    def rel_m(hhmm: str) -> int:
+    +        return (_m(hhmm) - anchor_min) % (24*60)
+    +    # Find ~23:00 anchor inside day range for AVWAP (optional)
+    +    di0, di1 = e0, e1  # day span approximated by London window edges
+    +    # better: use full day range from iterator; here we approximate with [range] if available
+    +    # We can recover true day [i0,i1] using the indices around e0.
+    +    # Map to trading-day bucket containing e0
+    +    # Locate current day start/end
+    +    day_starts = arr.starts; day_ends = arr.ends
+    +    # find day k such that e0 in [starts[k], ends[k])
+    +    _k = int(np.searchsorted(day_starts, e0) - 1)
+    +    _k = max(0, min(_k, len(day_starts)-1))
+    +    i0, i1 = int(day_starts[_k]), int(day_ends[_k])
+    +    v0, v1 = win_idx(arr.tmins, i0, i1, rel_m("23:00"), 24*60)
+    +    vwap_anchor = v0 if v0 is not None else None
+    +
+    +    # Detector router
+    +    def _route(strategy: str, arr: Arr, ctx: dict, params: dict):
+    +        if strategy in ("baseline", "", None):
+    +            return []
+    +        if strategy == "mix":
+    +            order = ["cb_vp","mfvg_s","svwap_sh","iib_c","wtr"]
+    +            for s in order:
+    +                try:
+    +                    mod = importlib.import_module(f"detectors.entry_{s}")
+    +                    fn = getattr(mod, f"detect_{s}")
+    +                    out = fn(arr, ctx, params)
+    +                    if out:
+    +                        return out
+    +                except Exception:
+    +                    continue
+    +            return []
+    +        mod = importlib.import_module(f"detectors.entry_{strategy}")
+    +        fn = getattr(mod, f"detect_{strategy}")
+    +        return fn(arr, ctx, params)
+    +
+    +    day_ctx = {
+    +        "p0": p0, "p1": p1, "l0": e0, "l1": e1,
+    +        "pre_lo": pre_lo, "pre_hi": pre_hi,
+    +        "kz_high": float(getattr(asia_info, "kz_high", np.nan)),
+    +        "kz_low": float(getattr(asia_info, "kz_low", np.nan)),
+    +        "direction": None,   # set below after bias
+    +        "vwap_anchor": vwap_anchor,
+    +    }
+    @@
+     # Determine target based on KZ extremes
+         target_price = None
+         target_direction = None
+    @@
+         if target_price is None or target_direction is None:
+             return trades
+    +
+    +    # Fill direction into context for detectors
+    +    day_ctx["direction"] = target_direction
+    +
+    +    # If using detector strategies, ask router for candidate entries
+    +    if getattr(config, "entry_strategy", "baseline") != "baseline":
+    +        try:
+    +            cands = _route(config.entry_strategy, arr, day_ctx, {
+    +                "atr_n": 14, "k_floor": 1.25
+    +            })
+    +        except Exception:
+    +            cands = []
+    +        for c in cands[:config.max_trades]:
+    +            if c.get("direction") != target_direction:
+    +                continue
+    +            entry_idx = int(c["entry_idx"])
+    +            trades.append({
+    +                "entry_time": pd.Timestamp(arr.dt[entry_idx]),
+    +                "entry_price": float(arr.cl[entry_idx]),
+    +                "target_price": float(target_price),
+    +                "stop_price": float(c["stop_price"]) if c.get("stop_price") is not None else None,
+    +                "direction": target_direction,
+    +                "scenario": f"det-{config.entry_strategy}",
+    +                "entry_idx": entry_idx
+    +            })
+    +        # If we produced detector trades, return; else fall back to baseline logic
+    +        if trades:
+    +            return trades
+    @@
+     # (existing baseline break/retest logic remains unchanged)
+```
+
+evaluation:
+walk\_forward:
+folds: \["2024Q1","2024Q2","2024Q3","2024Q4"]
+protocol: |
+Slice by trading\_day\_id (anchored at 17:00) into calendar quarters.
+For each fold:
+\- Grid search per method over its parameter ranges (Cartesian but pruned):
+· Enforce max\_trades\_per\_day=1 and NEXT\_BAR\_EXECUTION=True
+· Use --entry-strategy to pick the detector (baseline as control)
+\- Fix RR and cost model as in core (ALL\_IN\_COST\_PIPS constant) to isolate entry quality.
+Record per‑fold metrics, then average and report std‑dev across folds.
+metrics: \["win\_rate","expectancy\_per\_trade","avg\_R","max\_DD","Sharpe\_like(R)"]
+ablations:
+\- "remove compression prefilter (CB-VP): ignore α\_prelon; keep all else."
+\- "lower body ratio threshold by 20% (all where applicable)."
+\- "disable mFVG validation (only structure shift after partial fills)."
+\- "disable time-of-day gating (allow 01:30–04:30) to test session sensitivity."
+robustness:
+\- "parameter perturbation ±15% around best grid tuple."
+\- "gate time shift ±5 minutes on Pre‑London and London KZ boundaries."
+\- "spread bump +0.3 pip and +0.5 pip to stress fills and small‑R trades."
+reporting:
+\- "Per‑method trade blotter (trading\_day\_id, timestamps, price, SL/TP, R)."
+\- "By‑hour heatmap within 02:00–04:00 to confirm clustering."
+\- "Invalid‑day vs valid‑day outcome split to prove rule efficacy."
+\- "Detector notes (scenario labels) for forensic review."
+
+---
+
+**Prompt closure (quick):**
+Hooks: added `--entry-strategy` and a router inside `determine_trade_entries(...)`; detectors live under `detectors/entry_*.py` and return `entry_idx` (+ optional `stop_price`). No core simulator changes, so fills/costs/ambiguity remain identical. Only ambiguity: ATR/AVWAP are computed in detectors on the fly; if you prefer, we can later precompute and cache them in `build_arrays` for speed.&#x20;
+s

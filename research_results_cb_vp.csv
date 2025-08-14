@@ -1,0 +1,5 @@
+fold,strategy,params,variant,variant_detail,win_rate,expectancy,avg_R,max_dd,sharpe_like_R,trades
+2024Q1,cb_vp,"{'alpha_prelon_max': 0.32, 'beta': 0.8, 'gamma': 0.6, 'atr_n': 14}",baseline,,0.0,-113.68833333332235,-0.7000166575111445,-341.06499999996595,-1.6500467038034294,3
+2024Q2,cb_vp,"{'alpha_prelon_max': 0.32, 'beta': 0.8, 'gamma': 0.6, 'atr_n': 14}",baseline,,0.0,0.0,0.0,0.0,0.0,0
+2024Q3,cb_vp,"{'alpha_prelon_max': 0.32, 'beta': 0.8, 'gamma': 0.6, 'atr_n': 14}",baseline,,0.0,-115.03997222221933,-1.0,-345.11991666665745,0.0,3
+2024Q4,cb_vp,"{'alpha_prelon_max': 0.32, 'beta': 0.8, 'gamma': 0.6, 'atr_n': 14}",baseline,,0.3333333333333333,-39.34666666665462,-0.16372507238839154,-133.54000000000087,-0.1384366613342468,3

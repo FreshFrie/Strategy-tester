@@ -4,10 +4,10 @@
 | Session       | Time Range (UTC-4) | Purpose |
 |---------------|-------------------|---------|
 | Asia Curr     | `17:00` – `23:00` | Main Asia session for this trading day |
-| Asia Killzone | `19:00` – `21:00` | Key level generation: record high/low and mark if extremes occurred here |
+| Asia Killzone | `19:30` – `21:30` | Key level generation: record high/low and mark if extremes occurred here |
 | Pre-London    | `21:00` – `23:00` | Optional early filter (skip if KZ levels broken too early) |
 | London        | `23:00` – `05:00` | General session window |
-London KZ '01:00 - 04:00'
+London KZ '02:00 - 04:00'
 | Takeout       | Configurable (e.g., `01:00` – `08:00`) | Trade execution window |
 
 ---
