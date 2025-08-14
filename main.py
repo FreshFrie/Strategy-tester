@@ -28,13 +28,16 @@ from zoneinfo import ZoneInfo
 CSV_PATH = ""  # If empty or missing, we'll auto-detect a dataset CSV in the workspace
 DT_COL, O_COL, H_COL, L_COL, C_COL = "Time", "Open", "High", "Low", "Close"
 
-# Instrument settings
-TICK_SIZE = 0.25
-TICK_VALUE = 0.5        # MNQ micro futures $/tick (5.0 for NQ, 1.0 for CFD-like)
-POINT_VALUE = 1.0       # $ per 1 index point (CFD mode)
-SIZING_MODE = "contracts"  # {"contracts", "cfd"}
+# Instrument settings (FX defaults)
+TICK_SIZE = 0.0001      # 1 pip
+TICK_VALUE = 0.5        # Ignored in CFD mode
+POINT_VALUE = 1.0       # $ per 1 unit per 1 price point (CFD mode)
+SIZING_MODE = "cfd"     # Default to units-based CFD sizing
 POSITION_SIZE = 1.0
-SLIPPAGE_TICKS = 1
+SLIPPAGE_TICKS = 0      # We model costs via spread/commission instead
+
+# Trading costs (always-on for FX): round-trip all-in cost in pips
+ALL_IN_COST_PIPS = 1.0  # default 1.0 pip round-trip cost (entry + exit)
 
 # Strategy params
 R_MULT = 1.5
@@ -44,7 +47,7 @@ RISK_PCT_PER_TRADE = 0.01
 # New takeout and execution settings
 TAKEOUT_START_UTC = "01:00"
 TAKEOUT_END_UTC = "08:00"
-ENTRY_MODE = "break"  # {"break","retest"} relative to pre-London range
+ENTRY_MODE = "break"  # {"break","retest"}
 AMBIGUOUS_POLICY = "worst"  # {"worst","neutral","best"}
 MAX_TRADES_PER_DAY = 2
 COOLDOWN_MIN = 30
@@ -54,114 +57,97 @@ NEXT_BAR_EXECUTION = True
 ASIA_REPORT_PATH = "asia_kz_report.csv"
 
 # Performance settings
-READ_ENGINE: Optional[str] = None  # set to "pyarrow" if available
+READ_ENGINE: Optional[str] = None
 DOWNCAST_FLOATS = True
 
 def parse_args():
     parser = argparse.ArgumentParser(description="Killzone Backtester")
     parser.add_argument("--csv", default=CSV_PATH, help="Path to CSV file (optional; auto-detect if omitted)")
     parser.add_argument("--engine", choices=["pandas", "pyarrow"], help="CSV read engine")
-    parser.add_argument("--csv-format", choices=["auto","default", "mt"], default="auto", help="CSV schema: auto=sniff, default=Time,Open,High,Low,Close; mt=MetaTrader (date,time,OHLC,vol)")
-    parser.add_argument("--data-utc-offset", type=int, default=0, help="Hours offset of data timestamps relative to UTC (e.g., -5 for UTC-5, -4 for UTC-4). Used if --data-tz not provided.")
-    parser.add_argument("--data-tz", default="", help="IANA timezone of the data timestamps (e.g., America/New_York). If set, overrides --data-utc-offset and handles DST.")
+    parser.add_argument("--csv-format", choices=["auto", "default", "mt"], default="auto", help="CSV schema")
+    parser.add_argument("--data-utc-offset", type=int, default=0, help="Hours offset of data timestamps relative to UTC")
+    parser.add_argument("--data-tz", default="", help="IANA timezone of the data timestamps; overrides offset if set")
     parser.add_argument("--sizing", choices=["contracts", "cfd"], default=SIZING_MODE, help="Position sizing mode")
-    parser.add_argument("--tick-size", type=float, default=TICK_SIZE, help="Price increment (one tick)")
+    parser.add_argument("--tick-size", type=float, default=TICK_SIZE, help="Price increment (one tick / pip)")
     parser.add_argument("--tick-value", type=float, default=TICK_VALUE, help="$ per tick (contracts mode)")
     parser.add_argument("--point-value", type=float, default=POINT_VALUE, help="$ per point (CFD mode)")
     parser.add_argument("--risk-pct", type=float, default=RISK_PCT_PER_TRADE, help="Risk percentage per trade")
     parser.add_argument("--rr-ratio", type=float, default=R_MULT, help="Risk-to-Reward ratio (e.g., 1.5 for 1:1.5)")
     parser.add_argument("--takeout-start", default=TAKEOUT_START_UTC, help="Takeout window start time (HH:MM UTC)")
     parser.add_argument("--takeout-end", default=TAKEOUT_END_UTC, help="Takeout window end time (HH:MM UTC)")
-    # Session windows (UTC)
+    # Session windows (UTC, anchored mins)
     parser.add_argument("--asia-prev-start", default="00:00", help="Asia prev-day start (HH:MM UTC)")
     parser.add_argument("--asia-prev-end", default="00:00", help="Asia prev-day end (HH:MM UTC)")
     parser.add_argument("--asia-curr-start", default="17:00", help="Asia current-day start (HH:MM UTC)")
     parser.add_argument("--asia-curr-end", default="23:00", help="Asia current-day end (HH:MM UTC)")
-    parser.add_argument("--kz-start", default="19:00", help="Asia Killzone start (HH:MM UTC)")
-    parser.add_argument("--kz-end", default="21:00", help="Asia Killzone end (HH:MM UTC)")
-    parser.add_argument("--pre-start", default="21:00", help="Pre-London start (HH:MM UTC)")
-    parser.add_argument("--pre-end", default="23:00", help="Pre-London end (HH:MM UTC)")
-    parser.add_argument("--london-start", default="01:00", help="London session start (HH:MM UTC)")
+    parser.add_argument("--kz-start", default="19:30", help="Asia Killzone start (HH:MM UTC)")
+    parser.add_argument("--kz-end", default="21:30", help="Asia Killzone end (HH:MM UTC)")
+    parser.add_argument("--pre-start", default="23:00", help="Pre-London start (HH:MM UTC)")
+    parser.add_argument("--pre-end", default="02:00", help="Pre-London end (HH:MM UTC)")
+    parser.add_argument("--london-start", default="02:00", help="London session start (HH:MM UTC)")
     parser.add_argument("--london-end", default="04:00", help="London session end (HH:MM UTC)")
     parser.add_argument("--entry-mode", choices=["break", "retest"], default=ENTRY_MODE, help="Entry mode relative to pre-London range")
     parser.add_argument("--ambiguous", choices=["worst", "neutral", "best"], default=AMBIGUOUS_POLICY, help="Policy for ambiguous TP/SL bars")
     parser.add_argument("--max-trades", type=int, default=MAX_TRADES_PER_DAY, help="Maximum trades per day")
     parser.add_argument("--cooldown-min", type=int, default=COOLDOWN_MIN, help="Cooldown minutes between trades")
-    # Early takeout is now core and always enforced (kz-to-london); no CLI flags
     parser.add_argument("--no-write", action="store_true", help="Skip writing CSV outputs")
     return parser.parse_args()
 
-# =============================
-# ===== Asia KZ Analysis ======
-# =============================
-
-@dataclass
-class AsiaKZInfo:
-    session_high: float
-    session_low: float
-    session_high_time: pd.Timestamp
-    session_low_time: pd.Timestamp
-    kz_high: float
-    kz_low: float
-    high_made_in_kz: bool
-    low_made_in_kz: bool
-    kz_high_time: pd.Timestamp
-    kz_low_time: pd.Timestamp
-
 def build_asia_report(df: pd.DataFrame, out_path: str, config):
     """
-    Fast Asia/KZ verification report using array day windows (O(n)).
-    One row per current day with: date, session_high/low (+times), kz_high/low (+times), flags.
-    Asia: 22:00 prev → 04:00 curr (UTC). KZ: 00:00–02:00 in current.
+    Fast Asia/KZ verification report using anchored trading-day windows (O(n)).
+    One row per anchored trading day with: date, session_high/low (+times), kz_high/low (+times), flags.
     """
-    arr = build_arrays(df)
-    rows = []
+    arr = build_arrays(df, config)
+    rows: list[dict] = []
     n_days = len(arr.u_days)
 
     def _m(hhmm: str) -> int:
         h, m = map(int, hhmm.split(":"))
-        return h*60 + m
+        return h * 60 + m
+    anchor_min = _m(config.asia_curr_start)
+    def rel_m(hhmm: str) -> int:
+        return (_m(hhmm) - anchor_min) % (24*60)
 
-    for k in range(1, n_days):  # need previous day
-        prev_i0, prev_i1 = arr.starts[k-1], arr.ends[k-1]
+    for k in range(1, n_days):  # need previous anchored day for Asia Prev
+        prev_i0, prev_i1 = arr.starts[k - 1], arr.ends[k - 1]
         i0, i1 = arr.starts[k], arr.ends[k]
 
-        # Asia windows
-        a0a, a1a = win_idx(arr.mins, prev_i0, prev_i1, _m(config.asia_prev_start), _m(config.asia_prev_end))
-        a0b, a1b = win_idx(arr.mins, i0, i1, _m(config.asia_curr_start), _m(config.asia_curr_end))
+        # Asia windows using anchored minutes
+        a0a, a1a = win_idx(arr.tmins, prev_i0, prev_i1, rel_m(config.asia_prev_start), rel_m(config.asia_prev_end))
+        a0b, a1b = win_idx(arr.tmins, i0, i1, rel_m(config.asia_curr_start), rel_m(config.asia_curr_end))
         if (a0a is None or a1a is None) and (a0b is None or a1b is None):
             continue
 
-        # Session extremes across both slices (earliest occurrence logic)
-        segs = []
+        segs: list[tuple[int, int]] = []
         if a0a is not None and a1a is not None and a0a < a1a:
             segs.append((a0a, a1a))
         if a0b is not None and a1b is not None and a0b < a1b:
             segs.append((a0b, a1b))
+        if not segs:
+            continue
 
-        # High
+        # Session extremes (earliest occurrence on ties)
         sh_val, sh_idx = -np.inf, None
-        for s0, s1 in segs:
-            local_max = float(np.max(arr.hi[s0:s1]))
-            rel = int(np.flatnonzero(arr.hi[s0:s1] == local_max)[0])
-            cand = s0 + rel
-            if (local_max > sh_val) or (np.isclose(local_max, sh_val) and (sh_idx is None or cand < sh_idx)):
-                sh_val, sh_idx = local_max, cand
-
-        # Low
         sl_val, sl_idx = np.inf, None
         for s0, s1 in segs:
+            local_max = float(np.max(arr.hi[s0:s1]))
+            hi_rel = int(np.flatnonzero(arr.hi[s0:s1] == local_max)[0])
+            cand_hi = s0 + hi_rel
+            if (local_max > sh_val) or (np.isclose(local_max, sh_val) and (sh_idx is None or cand_hi < sh_idx)):
+                sh_val, sh_idx = local_max, cand_hi
+
             local_min = float(np.min(arr.lo[s0:s1]))
-            rel = int(np.flatnonzero(arr.lo[s0:s1] == local_min)[0])
-            cand = s0 + rel
-            if (local_min < sl_val) or (np.isclose(local_min, sl_val) and (sl_idx is None or cand < sl_idx)):
-                sl_val, sl_idx = local_min, cand
+            lo_rel = int(np.flatnonzero(arr.lo[s0:s1] == local_min)[0])
+            cand_lo = s0 + lo_rel
+            if (local_min < sl_val) or (np.isclose(local_min, sl_val) and (sl_idx is None or cand_lo < sl_idx)):
+                sl_val, sl_idx = local_min, cand_lo
 
         sh_t = pd.Timestamp(arr.dt[sh_idx]) if sh_idx is not None else pd.NaT
         sl_t = pd.Timestamp(arr.dt[sl_idx]) if sl_idx is not None else pd.NaT
 
-        # KZ in current day (config.kz_start–config.kz_end in current day window)
-        kz0, kz1 = win_idx(arr.mins, i0, i1, _m(config.kz_start), _m(config.kz_end))
+        # KZ in current anchored day
+        kz0, kz1 = win_idx(arr.tmins, i0, i1, rel_m(config.kz_start), rel_m(config.kz_end))
         if kz0 is None or kz1 is None or kz0 >= kz1:
             kh = kl = float("nan")
             kh_t = kl_t = pd.NaT
@@ -177,31 +163,53 @@ def build_asia_report(df: pd.DataFrame, out_path: str, config):
             kh_t = pd.Timestamp(arr.dt[kz0 + kh_rel])
             kl_t = pd.Timestamp(arr.dt[kz0 + kl_rel])
             high_in_kz = (sh_idx is not None) and (kz0 <= sh_idx < kz1)
-            low_in_kz  = (sl_idx is not None) and (kz0 <= sl_idx < kz1)
+            low_in_kz = (sl_idx is not None) and (kz0 <= sl_idx < kz1)
 
-            # Early takeout indicator (kz-to-london): 1 if NOT taken out, 0 if taken out
-            # Only applicable when a high or low was made in KZ; else leave blank
+            # Early takeout indicator (kz end → London start across wrap)
+            early_bias = ""
             if high_in_kz or low_in_kz:
                 early = False
-                london_start_min = _m(config.london_start)
-                slices = []
-                # Slice 1: current day tail from KZ end index to end of current day
-                if kz1 is not None and i1 is not None and kz1 < i1:
+                london_start_min = rel_m(config.london_start)
+                slices: list[tuple[int, int]] = []
+                # tail of current day after KZ end
+                if kz1 < i1:
                     slices.append((kz1, i1))
-                # Slice 2: next day head from 00:00 to London start
+                # head of next day up to London start
                 if k + 1 < n_days:
-                    ni0, ni1 = arr.starts[k+1], arr.ends[k+1]
-                    nw0, nw1 = win_idx(arr.mins, ni0, ni1, 0, london_start_min)
+                    ni0, ni1 = arr.starts[k + 1], arr.ends[k + 1]
+                    nw0, nw1 = win_idx(arr.tmins, ni0, ni1, 0, london_start_min)
                     if nw0 is not None and nw1 is not None and nw0 < nw1:
                         slices.append((nw0, nw1))
                 if slices:
+                    # Strict breaches beyond the exact KZ extremes
+                    first_high_idx = None
+                    first_low_idx = None
                     if high_in_kz:
-                        if any(np.any(arr.hi[s0:s1] >= kh) for s0, s1 in slices):
-                            early = True
+                        for s0, s1 in slices:
+                            idx = np.flatnonzero(arr.hi[s0:s1] > kh + 1e-12)
+                            if idx.size:
+                                cand = s0 + int(idx[0])
+                                if first_high_idx is None or cand < first_high_idx:
+                                    first_high_idx = cand
                     if low_in_kz:
-                        if any(np.any(arr.lo[s0:s1] <= kl) for s0, s1 in slices):
+                        for s0, s1 in slices:
+                            idx = np.flatnonzero(arr.lo[s0:s1] < kl - 1e-12)
+                            if idx.size:
+                                cand = s0 + int(idx[0])
+                                if first_low_idx is None or cand < first_low_idx:
+                                    first_low_idx = cand
+                    # For both-in-KZ days, establish bias instead of invalidating the day
+                    if high_in_kz and low_in_kz:
+                        if first_high_idx is not None and (first_low_idx is None or first_high_idx < first_low_idx):
+                            early_bias = "high_takeout"
+                        elif first_low_idx is not None and (first_high_idx is None or first_low_idx < first_high_idx):
+                            early_bias = "low_takeout"
+                        early = False  # don’t invalidate on both-in-KZ days
+                    else:
+                        if first_high_idx is not None:
                             early = True
-                # Map to requested labels: kz(1) = no early takeout, kz(0) = early takeout occurred
+                        if first_low_idx is not None:
+                            early = True
                 early_indicator = "kz(0)" if early else "kz(1)"
             else:
                 early_indicator = ""
@@ -209,51 +217,48 @@ def build_asia_report(df: pd.DataFrame, out_path: str, config):
         rows.append({
             "date": pd.Timestamp(arr.u_days[k]),
             "session_high": float(sh_val), "session_high_time": sh_t,
-            "session_low":  float(sl_val), "session_low_time":  sl_t,
+            "session_low": float(sl_val), "session_low_time": sl_t,
             "kz_high": kh, "kz_high_time": kh_t,
-            "kz_low":  kl, "kz_low_time":  kl_t,
+            "kz_low": kl, "kz_low_time": kl_t,
             "high_made_in_kz": high_in_kz,
-            "low_made_in_kz":  low_in_kz,
+            "low_made_in_kz": low_in_kz,
             "early_takeout": early_indicator,
+            "early_bias": early_bias,
         })
 
     rep = pd.DataFrame(rows) if rows else pd.DataFrame(columns=[
-        "date","session_high","session_high_time","session_low","session_low_time",
-        "kz_high","kz_high_time","kz_low","kz_low_time","high_made_in_kz","low_made_in_kz"
+        "date", "session_high", "session_high_time", "session_low", "session_low_time",
+        "kz_high", "kz_high_time", "kz_low", "kz_low_time", "high_made_in_kz", "low_made_in_kz"
     ])
-    # Build a formatted report per the requested schema
     fmt = pd.DataFrame()
-    # day as MM-DD Ddd (no year)
     fmt["day"] = pd.to_datetime(rep["date"]).dt.strftime("%m-%d %a")
-    # times HH:MM
     for col, outcol in (
-        ("session_high_time","session_high_time"),
-        ("session_low_time","session_low_time"),
-        ("kz_high_time","kz_high_time"),
-        ("kz_low_time","kz_low_time"),
+        ("session_high_time", "session_high_time"),
+        ("session_low_time", "session_low_time"),
+        ("kz_high_time", "kz_high_time"),
+        ("kz_low_time", "kz_low_time"),
     ):
         fmt[outcol] = pd.to_datetime(rep[col]).dt.strftime("%H:%M").fillna("")
-    # prices to 7 decimals
     def fmt7(s: pd.Series) -> pd.Series:
         return s.astype(float).map(lambda x: f"{x:.7f}")
-    fmt["session_high"] = fmt7(rep["session_high"]) 
-    fmt["session_low"] = fmt7(rep["session_low"]) 
-    fmt["kz_high"] = fmt7(rep["kz_high"]) 
-    fmt["kz_low"] = fmt7(rep["kz_low"]) 
-    # keep flags for reference at the end
-    fmt["high_made_in_kz"] = rep["high_made_in_kz"].astype(bool)
-    fmt["low_made_in_kz"] = rep["low_made_in_kz"].astype(bool)
-    # early takeout indicator: "1" (no early), "0" (early), or blank
-    if "early_takeout" in rep.columns:
-        fmt["early_takeout"] = rep["early_takeout"].astype(str).replace({"nan": ""})
+    if not rep.empty:
+        fmt["session_high"] = fmt7(rep["session_high"]) 
+        fmt["session_low"] = fmt7(rep["session_low"]) 
+        fmt["kz_high"] = fmt7(rep["kz_high"]) 
+        fmt["kz_low"] = fmt7(rep["kz_low"]) 
+        fmt["high_made_in_kz"] = rep["high_made_in_kz"].astype(bool)
+        fmt["low_made_in_kz"] = rep["low_made_in_kz"].astype(bool)
+        fmt["early_takeout"] = rep.get("early_takeout", pd.Series([], dtype=str)).astype(str).replace({"nan": ""})
+        if "early_bias" in rep.columns:
+            fmt["early_bias"] = rep["early_bias"].astype(str).replace({"nan": ""})
     fmt.to_csv(out_path, index=False)
-    # Ensure any previous pretty text is removed
     try:
         pretty_path = os.path.splitext(out_path)[0] + ".pretty.txt"
         if os.path.exists(pretty_path):
             os.remove(pretty_path)
     except Exception:
         pass
+
 
 def analyze_asia_session_arr(arr: Arr, asia_prev: Tuple[Optional[int], Optional[int]], asia_curr: Tuple[Optional[int], Optional[int]], config=None) -> Optional[AsiaKZInfo]:
     """Array-based Asia session analysis over prev[22-24] + curr[0-4] and KZ [0-2] within curr.
@@ -300,15 +305,18 @@ def analyze_asia_session_arr(arr: Arr, asia_prev: Tuple[Optional[int], Optional[
     def _m(hhmm: str) -> int:
         h, m = map(int, hhmm.split(":"))
         return h*60 + m
-    kz_s = _m(config.kz_start) if config is not None else 0
-    kz_e = _m(config.kz_end) if config is not None else 120
+    anchor_min = _m(config.asia_curr_start) if config is not None else 0
+    def rel_m(hhmm: str) -> int:
+        return (_m(hhmm) - anchor_min) % (24*60)
+    kz_s = rel_m(config.kz_start) if config is not None else 0
+    kz_e = rel_m(config.kz_end) if config is not None else 120
     kz0 = kz1 = None
     # Try in current segment
     if a0b is not None and a1b is not None and a0b < a1b:
-        kz0, kz1 = win_idx(arr.mins, a0b, a1b, kz_s, kz_e)
+        kz0, kz1 = win_idx(arr.tmins, a0b, a1b, kz_s, kz_e)
     # Fallback to previous segment
     if (kz0 is None or kz1 is None or kz0 >= kz1) and (a0a is not None and a1a is not None and a0a < a1a):
-        kz0, kz1 = win_idx(arr.mins, a0a, a1a, kz_s, kz_e)
+        kz0, kz1 = win_idx(arr.tmins, a0a, a1a, kz_s, kz_e)
     if kz0 is None or kz1 is None or kz0 >= kz1:
         return None
 
@@ -501,8 +509,42 @@ class Trade:
     kz_low_time: pd.Timestamp
 
 
+@dataclass
+class AsiaKZInfo:
+    session_high: float
+    session_low: float
+    session_high_time: pd.Timestamp
+    session_low_time: pd.Timestamp
+    kz_high: float
+    kz_low: float
+    high_made_in_kz: bool
+    low_made_in_kz: bool
+    kz_high_time: pd.Timestamp
+    kz_low_time: pd.Timestamp
+
+
 def _round_to_tick(x: float) -> float:
     return round(x / TICK_SIZE) * TICK_SIZE
+
+def _round_to_pip(x: float, pip: float = None) -> float:
+    p = pip if pip is not None else TICK_SIZE
+    return round(x / p) * p
+
+def apply_trading_costs(entry_fill: float, exit_price: float, side: str, spread_pips: float, commission_pips: float) -> tuple[float, float]:
+    """Apply half-spread at entry and exit, plus commission symmetrically in pips.
+    Returns adjusted (entry_fill_adj, exit_price_adj).
+    """
+    pip = TICK_SIZE
+    half_spread = (spread_pips / 2.0) * pip
+    half_comm = (commission_pips / 2.0) * pip
+    if side == "LONG":
+        entry_adj = entry_fill + half_spread + half_comm
+        exit_adj  = exit_price - half_spread - half_comm
+    else:
+        entry_adj = entry_fill - half_spread - half_comm
+        exit_adj  = exit_price + half_spread + half_comm
+    # Round to pip precision
+    return _round_to_pip(entry_adj, pip), _round_to_pip(exit_adj, pip)
 
 
 def compute_qty(entry: float, stop: float, equity: float, risk_pct: float,
@@ -603,8 +645,10 @@ def load_data(path: str, engine: Optional[str] = None, csv_format: str = "defaul
 class Arr:
     pass
 
-def build_arrays(df: pd.DataFrame) -> Arr:
-    """Build one-time NumPy arrays and day boundaries from dataframe."""
+def build_arrays(df: pd.DataFrame, config=None) -> Arr:
+    """Build one-time NumPy arrays and trading-day boundaries from dataframe.
+    Trading day rolls at asia_curr_start (anchor). This prevents mixing across calendar days.
+    """
     arr = Arr()
     arr.dt = df["dt_utc"].to_numpy()
     arr.date = df["date_utc"].to_numpy()
@@ -614,8 +658,23 @@ def build_arrays(df: pd.DataFrame) -> Arr:
     arr.lo = df["low"].to_numpy()
     arr.cl = df["close"].to_numpy()
 
-    u_days, starts = np.unique(arr.date, return_index=True)
-    ends = np.r_[starts[1:], len(arr.date)]
+    # Compute anchored trading day key using asia_curr_start as the day roll
+    def _m(hhmm: str) -> int:
+        h, m = map(int, hhmm.split(":"))
+        return h * 60 + m
+    anchor_min = _m(config.asia_curr_start) if config is not None else 0
+    anchor_delta = pd.to_timedelta(anchor_min, unit="m")
+    shifted = df["dt_utc"] - anchor_delta
+    # shifted is tz-aware in UTC; date() of shifted defines the trading day key
+    trading_day = shifted.dt.date
+    trading_min = shifted.dt.hour.astype(np.int16) * 60 + shifted.dt.minute.astype(np.int16)
+
+    arr.trading_day = trading_day.to_numpy()
+    arr.tmins = trading_min.to_numpy()
+
+    # Build day buckets off anchored trading_day
+    u_days, starts = np.unique(arr.trading_day, return_index=True)
+    ends = np.r_[starts[1:], len(arr.trading_day)]
     arr.u_days, arr.starts, arr.ends = u_days, starts, ends
     return arr
 
@@ -680,23 +739,24 @@ def iter_trading_days_arr(arr: Arr, config):
         def _m(hhmm: str) -> int:
             h, m = map(int, hhmm.split(":"))
             return h * 60 + m
+        anchor_min = _m(config.asia_curr_start)
+        def rel_m(hhmm: str) -> int:
+            return (_m(hhmm) - anchor_min) % (24*60)
 
         # Asia: prev + curr (configurable)
-        a0a, a1a = win_idx(arr.mins, prev_i0, prev_i1, _m(config.asia_prev_start), _m(config.asia_prev_end))
-        a0b, a1b = win_idx(arr.mins, i0, i1, _m(config.asia_curr_start), _m(config.asia_curr_end))
+        a0a, a1a = win_idx(arr.tmins, prev_i0, prev_i1, rel_m(config.asia_prev_start), rel_m(config.asia_prev_end))
+        a0b, a1b = win_idx(arr.tmins, i0, i1, rel_m(config.asia_curr_start), rel_m(config.asia_curr_end))
         if a0a is None and a0b is None:
             continue
 
         # Pre-London
-        p0, p1 = win_idx(arr.mins, i0, i1, _m(config.pre_start), _m(config.pre_end))
+        p0, p1 = win_idx(arr.tmins, i0, i1, rel_m(config.pre_start), rel_m(config.pre_end))
 
         # London (optional)
-        l0, l1 = win_idx(arr.mins, i0, i1, _m(config.london_start), _m(config.london_end))
+        l0, l1 = win_idx(arr.tmins, i0, i1, rel_m(config.london_start), rel_m(config.london_end))
 
         # Takeout window (config)
-        ts_h, ts_m = map(int, config.takeout_start.split(":"))
-        te_h, te_m = map(int, config.takeout_end.split(":"))
-        t0, t1 = win_idx(arr.mins, i0, i1, ts_h * 60 + ts_m, te_h * 60 + te_m)
+        t0, t1 = win_idx(arr.tmins, i0, i1, rel_m(config.takeout_start), rel_m(config.takeout_end))
 
         if (l0 is None) or (t0 is None):
             continue
@@ -712,7 +772,8 @@ def iter_trading_days_arr(arr: Arr, config):
         }   
 
 def determine_trade_entries(asia_info: AsiaKZInfo, takeouts: list[Tuple[str, pd.Timestamp, int]],
-                           arr: Arr, e0: int, e1: int, p0: Optional[int], p1: Optional[int], config) -> list[dict]:
+                           arr: Arr, e0: int, e1: int, p0: Optional[int], p1: Optional[int], config,
+                           early_bias: Optional[str] = None) -> list[dict]:
     """Determine trade entries based on Asia KZ analysis with KZ levels as targets.
     Entry search is restricted to the London window [e0,e1)."""
     trades = []
@@ -742,15 +803,19 @@ def determine_trade_entries(asia_info: AsiaKZInfo, takeouts: list[Tuple[str, pd.
     
     # Scenario 2: Both extremes made in KZ - use takeout direction
     elif asia_info.high_made_in_kz and asia_info.low_made_in_kz:
-        if not takeouts:
-            return trades  # Need takeouts for this scenario
-        # Use first takeout to determine bias
-        first_takeout_type, takeout_time, _ = takeouts[0]
+        # Prefer pre-London early-bias if provided; else fall back to first takeout in takeout window
+        first_takeout_type = None
+        if early_bias in ("high_takeout", "low_takeout"):
+            first_takeout_type = early_bias
+        elif takeouts:
+            first_takeout_type, _, _ = takeouts[0]
+        if first_takeout_type is None:
+            return trades  # No bias established; skip entries for the day
         if first_takeout_type == "high_takeout":
-            target_price = asia_info.kz_low  # Target low after high takeout
+            target_price = asia_info.kz_low
             target_direction = "SHORT"
         else:
-            target_price = asia_info.kz_high  # Target high after low takeout  
+            target_price = asia_info.kz_high
             target_direction = "LONG"
     
     if target_price is None or target_direction is None:
@@ -828,6 +893,7 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
     equity = START_CAPITAL
     trades: list[Trade] = []
     equity_points = []
+    early_dbg_rows: list[dict] = []
     days_skipped_sizing = 0
     days_no_kz_setup = 0
     days_early_takeout = 0
@@ -835,8 +901,8 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
     days_with_trades = 0
     day_count = 0
 
-    # Build arrays once
-    arr = build_arrays(df)
+    # Build arrays once with anchored trading-day bucketing
+    arr = build_arrays(df, config)
 
     for day_data in iter_trading_days_arr(arr, config):
         day_count += 1
@@ -863,19 +929,22 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
         def _m(hhmm: str) -> int:
             h, m = map(int, hhmm.split(":"))
             return h * 60 + m
-        kz_end_min = _m(config.kz_end)
-        london_kz_start_min = _m(config.london_start)
+        anchor_min = _m(config.asia_curr_start)
+        def rel_m(hhmm: str) -> int:
+            return (_m(hhmm) - anchor_min) % (24*60)
+        kz_end_min = rel_m(config.kz_end)
+        london_kz_start_min = rel_m(config.london_start)
 
         # Determine where KZ lived (prev or curr) by checking times
         a_prev0, a_prev1 = a_prev
         a_curr0, a_curr1 = a_curr
         kz_seg = None  # ('prev' or 'curr')
         if a_curr0 is not None and a_curr1 is not None:
-            k0, k1 = win_idx(arr.mins, a_curr0, a_curr1, _m(config.kz_start), kz_end_min)
+            k0, k1 = win_idx(arr.tmins, a_curr0, a_curr1, rel_m(config.kz_start), kz_end_min)
             if k0 is not None and k1 is not None and k0 < k1:
                 kz_seg = ('curr', k0, k1)
         if kz_seg is None and a_prev0 is not None and a_prev1 is not None:
-            k0, k1 = win_idx(arr.mins, a_prev0, a_prev1, _m(config.kz_start), kz_end_min)
+            k0, k1 = win_idx(arr.tmins, a_prev0, a_prev1, rel_m(config.kz_start), kz_end_min)
             if k0 is not None and k1 is not None and k0 < k1:
                 kz_seg = ('prev', k0, k1)
 
@@ -885,46 +954,126 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
             seg, k0, k1 = kz_seg
             kz_end_idx = k1
             if seg == 'curr':
-                # From kz_end_idx to london_kz_start in current day
+                # From KZ end to end of current day, plus next day head up to London start
                 ci0, ci1 = day_data['range']
-                w0, w1 = win_idx(arr.mins, ci0, ci1, kz_end_min, london_kz_start_min)
+                # Tail of current day after KZ end
+                w0, w1 = win_idx(arr.tmins, ci0, ci1, kz_end_min, 24*60)
                 if w0 is not None and w1 is not None and w0 < w1:
                     slices.append((w0, w1))
+                # Head of next day up to London start
+                # Find next day range by locating ci1 in arr.starts
+                try:
+                    knext = int(np.searchsorted(arr.starts, ci1))
+                except Exception:
+                    knext = None
+                if knext is not None and knext < len(arr.starts):
+                    if int(arr.starts[knext]) == int(ci1):
+                        ni0, ni1 = int(arr.starts[knext]), int(arr.ends[knext])
+                        nw0, nw1 = win_idx(arr.tmins, ni0, ni1, 0, london_kz_start_min)
+                        if nw0 is not None and nw1 is not None and nw0 < nw1:
+                            slices.append((nw0, nw1))
             else:
                 # KZ in prev day: from k1 to end of prev Asia window, plus from start of curr day to london_kz_start
                 ap0, ap1 = a_prev
                 if ap1 is not None and kz_end_idx < ap1:
                     slices.append((kz_end_idx, ap1))
                 ci0, ci1 = day_data['range']
-                w0, w1 = win_idx(arr.mins, ci0, ci1, 0, london_kz_start_min)
+                w0, w1 = win_idx(arr.tmins, ci0, ci1, 0, london_kz_start_min)
                 if w0 is not None and w1 is not None and w0 < w1:
                     slices.append((w0, w1))
 
-        # Check takeout across slices
+        # Check takeout across slices and capture debug
+        took_high = False
+        took_low = False
+        early_bias = None
+        cur_tail_hi = cur_tail_lo = next_head_hi = next_head_lo = float('nan')
         if slices:
+            # Aggregate stats for debug
+            cur_day_tail = []
+            nxt_day_head = []
+            for s0, s1 in slices:
+                # classify as current tail or next head by minute bins
+                # If tmins at s0 >= kz_end_min, it's current tail; otherwise it's next head up to London
+                if arr.tmins[s0] >= kz_end_min:
+                    cur_day_tail.append((s0, s1))
+                else:
+                    nxt_day_head.append((s0, s1))
+            if cur_day_tail:
+                ct0, ct1 = cur_day_tail[0][0], cur_day_tail[-1][1]
+                cur_tail_hi = float(np.max(arr.hi[ct0:ct1]))
+                cur_tail_lo = float(np.min(arr.lo[ct0:ct1]))
+            if nxt_day_head:
+                nh0, nh1 = nxt_day_head[0][0], nxt_day_head[-1][1]
+                next_head_hi = float(np.max(arr.hi[nh0:nh1]))
+                next_head_lo = float(np.min(arr.lo[nh0:nh1]))
+
+            # Require strict breaches beyond KZ extremes
+            # Find earliest breach time across slices for both levels
+            first_high_idx = None
+            first_low_idx = None
             if asia_info.high_made_in_kz:
-                if any(np.any(arr.hi[s0:s1] >= asia_info.kz_high) for s0, s1 in slices):
-                    early = True
+                for s0, s1 in slices:
+                    idx = np.flatnonzero(arr.hi[s0:s1] > asia_info.kz_high + 1e-12)
+                    if idx.size:
+                        cand = s0 + int(idx[0])
+                        if first_high_idx is None or cand < first_high_idx:
+                            first_high_idx = cand
+                took_high = first_high_idx is not None
             if asia_info.low_made_in_kz:
-                if any(np.any(arr.lo[s0:s1] <= asia_info.kz_low) for s0, s1 in slices):
+                for s0, s1 in slices:
+                    idx = np.flatnonzero(arr.lo[s0:s1] < asia_info.kz_low - 1e-12)
+                    if idx.size:
+                        cand = s0 + int(idx[0])
+                        if first_low_idx is None or cand < first_low_idx:
+                            first_low_idx = cand
+                took_low = first_low_idx is not None
+
+            # Determine early bias order if both KZ extremes exist
+            if asia_info.high_made_in_kz and asia_info.low_made_in_kz:
+                if first_high_idx is not None and (first_low_idx is None or first_high_idx < first_low_idx):
+                    early_bias = "high_takeout"
+                elif first_low_idx is not None and (first_high_idx is None or first_low_idx < first_high_idx):
+                    early_bias = "low_takeout"
+            else:
+                # For single-side KZ days, mark early if the significant side was breached
+                if asia_info.high_made_in_kz and took_high:
                     early = True
+                if asia_info.low_made_in_kz and took_low:
+                    early = True
+
+        # Append early-takeout debug row
+        early_dbg_rows.append({
+            "day": pd.Timestamp(day_ts),
+            "kz_high": float(getattr(asia_info, 'kz_high', float('nan'))),
+            "kz_low": float(getattr(asia_info, 'kz_low', float('nan'))),
+            "high_in_kz": bool(getattr(asia_info, 'high_made_in_kz', False)),
+            "low_in_kz": bool(getattr(asia_info, 'low_made_in_kz', False)),
+            "cur_tail_max_hi": cur_tail_hi,
+            "cur_tail_min_lo": cur_tail_lo,
+            "next_head_max_hi": next_head_hi,
+            "next_head_min_lo": next_head_lo,
+            "took_high": bool(took_high),
+            "took_low": bool(took_low),
+            "early_takeout": bool(early),
+            "early_bias": early_bias or "",
+        })
         if early:
             days_early_takeout += 1
             equity_points.append({"date": day_ts, "equity": equity})
             continue  # Skip day if early takeout occurred
-            
+
         # Step 3: Get the takeout window (configurable)
         # Already have t0,t1 from iterator
         if t0 is None or t1 is None or t0 >= t1:
             equity_points.append({"date": day_ts, "equity": equity})
             continue
-            
+
         # Step 4: Monitor takeout window for KZ level breaches
         takeouts = monitor_takeouts_arr(arr, t0, t1, asia_info)
 
         # Step 5: Determine trade entries based on scenario (KZ levels as targets)
         # Restrict entry search to the London window [l0,l1)
-        potential_trades = determine_trade_entries(asia_info, takeouts, arr, l0, l1, p0, p1, config)
+        potential_trades = determine_trade_entries(asia_info, takeouts, arr, l0, l1, p0, p1, config, early_bias=early_bias)
 
         if not potential_trades:
             days_no_setups += 1
@@ -963,17 +1112,20 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
             # 1R is purely based on price distance; don't snap to a global tick (FX has fine increments)
             one_r_points = max(1e-12, dist_to_target / rr)
             if direction == "LONG":
-                stop_fill   = float(entry_fill - one_r_points)
+                stop_fill   = _round_to_pip(float(entry_fill - one_r_points))
             else:
-                stop_fill   = float(entry_fill + one_r_points)
+                stop_fill   = _round_to_pip(float(entry_fill + one_r_points))
 
             # Orientation sanity: only take trades moving toward target
             if (direction == "LONG" and entry_fill >= target_fill) or (direction == "SHORT" and entry_fill <= target_fill):
                 # Already beyond/at the target; invalid orientation
                 continue
 
-            # Calculate position size using risk-first approach
-            qty = compute_qty(entry_fill, stop_fill, equity, config.risk_pct,
+            # Apply costs to entry (half-spread + half-commission each side). Use ALL_IN_COST_PIPS split evenly.
+            entry_fill_costed, _ = apply_trading_costs(entry_fill, entry_fill, direction, ALL_IN_COST_PIPS, 0.0)
+
+            # Calculate position size using risk-first approach (risk measured vs stop after pip rounding)
+            qty = compute_qty(entry_fill_costed, stop_fill, equity, config.risk_pct,
                               config.sizing, TICK_SIZE, TICK_VALUE, POINT_VALUE)
 
             # Sizing audit values (for output diagnostics)
@@ -1058,7 +1210,10 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
                     assert exit_price >= stop_fill - 1e-9
 
             # Calculate PnL and R-multiple
-            pnl_currency = calculate_pnl(entry_fill, exit_price, qty, direction,
+            # Apply costs at both entry and exit (split the ALL_IN_COST_PIPS equally as spread proxy)
+            entry_after_costs, exit_after_costs = apply_trading_costs(entry_fill, exit_price, direction, ALL_IN_COST_PIPS, 0.0)
+
+            pnl_currency = calculate_pnl(entry_after_costs, exit_after_costs, qty, direction,
                                          config.sizing, TICK_SIZE, TICK_VALUE, POINT_VALUE)
 
             # Calculate R-multiple using planned 1R distance (keeps TP near RR despite tick rounding)
@@ -1149,6 +1304,12 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
         out.to_csv("trades.csv", index=False)
     if not config.no_write:
         eq_df.to_csv("equity_curve.csv", index=False)
+        # Write early-takeout debug next to input CSV if out_dir is set
+        try:
+            out_dir = getattr(config, 'out_dir', os.getcwd())
+            pd.DataFrame(early_dbg_rows).to_csv(os.path.join(out_dir, 'early_takeout_debug.csv'), index=False)
+        except Exception:
+            pass
 
     # Summary calculations
     if trades_df.empty:
@@ -1237,6 +1398,11 @@ if __name__ == "__main__":
     resolved_csv, resolved_fmt = _sniff_csv_format_and_path(config.csv_path, args.csv_format)
     config.csv_path = resolved_csv
     config.csv_format = resolved_fmt
+    # Determine output directory next to the input CSV
+    try:
+        config.out_dir = os.path.dirname(os.path.abspath(config.csv_path)) or os.getcwd()
+    except Exception:
+        config.out_dir = os.getcwd()
     
     print("=== NAS100 Killzone Backtester (Realistic Execution) ===")
     print(f"CSV: {config.csv_path}")
@@ -1273,21 +1439,23 @@ if __name__ == "__main__":
     print(f"Data loaded: {len(df):,} rows in {load_time:.2f}s")
 
     # Always write fresh Asia/KZ verification report
+    report_path = os.path.join(config.out_dir, ASIA_REPORT_PATH)
     try:
-        if os.path.exists(ASIA_REPORT_PATH):
-            os.remove(ASIA_REPORT_PATH)
+        if os.path.exists(report_path):
+            os.remove(report_path)
     except Exception:
         pass
-    print(f"Writing Asia/KZ report → {ASIA_REPORT_PATH}")
-    build_asia_report(df, ASIA_REPORT_PATH, config)
+    print(f"Writing Asia/KZ report → {report_path}")
+    build_asia_report(df, report_path, config)
     
     print("Running backtest...")
     backtest_start = time.perf_counter()
     # Optional: wipe previous trades.csv to avoid overlap, only when writing is enabled
     if not config.no_write:
         try:
-            if os.path.exists("trades.csv"):
-                os.remove("trades.csv")
+            tpath = os.path.join(config.out_dir, "trades.csv")
+            if os.path.exists(tpath):
+                os.remove(tpath)
         except Exception:
             pass
     trades, equity = backtest(df, config)
@@ -1301,4 +1469,4 @@ if __name__ == "__main__":
     print(f"Backtest:  {backtest_time:.2f}s") 
     print(f"Total:     {total_time:.2f}s")
     print()
-    print("Output files: trades.csv, equity_curve.csv")
+    print(f"Output files: {os.path.join(config.out_dir, 'trades.csv')}, {os.path.join(config.out_dir, 'equity_curve.csv')}")

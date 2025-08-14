@@ -1,0 +1,10 @@
+2) Trading-day bucketing across midnight (Asia spans two dates)
+
+Define a “trading day anchor” (e.g., day rolls at 17:00 UTC-4 when Asia Curr begins). Use this day key everywhere (Asia KZ extremes, invalid-day flag, Pre-London, London KZ).
+Otherwise you’ll accidentally:
+
+pull the wrong Asia Prev segment,
+
+mix levels across calendar days,
+
+or mis-tag invalid days that tripped on the wrong date container.
