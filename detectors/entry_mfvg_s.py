@@ -8,8 +8,8 @@ def detect_mfvg_s(arr, day_ctx, params):
     direction = day_ctx["direction"]
     n = int(params.get("atr_n", 14))
     atr = atr_sma(hi, lo, cl, n)
-    gap_min = float(params.get("gap_min_atr", 0.6))
-    f = float(params.get("fill_frac", 0.5))
+    gap_min = float(params.get("gap_min_atr", 0.4))
+    f = float(params.get("fill_frac", 0.66))
     lb = int(params.get("lb_fractal", 3))
 
     # Compute fractal swings only on a local segment around London window to avoid full-series cost
@@ -40,7 +40,14 @@ def detect_mfvg_s(arr, day_ctx, params):
             if piv_hi_idx.size == 0:
                 continue
             if cl[k] > hi[piv_hi_idx[-1]]:
-                out.append({"entry_idx": k, "direction": "LONG", "stop_price": float(hi[m - 1] - 0.1 * atr[k]), "note": "mfvg_s"})
+                out.append({
+                    "entry_idx": k,
+                    "direction": "LONG",
+                    "stop_price": float(hi[m - 1] - 0.1 * atr[k]),
+                    "note": "mfvg_s",
+                    "features": {"gap_atr": float(g/atr[m]) if np.isfinite(atr[m]) and atr[m]>0 else 0.0, "fill_frac": float(f), "swing_confirm": True},
+                    "score": None
+                })
         else:
             if not (lo[m - 1] > hi[m + 1]):
                 continue
@@ -61,5 +68,12 @@ def detect_mfvg_s(arr, day_ctx, params):
             if piv_lo_idx.size == 0:
                 continue
             if cl[k] < lo[piv_lo_idx[-1]]:
-                out.append({"entry_idx": k, "direction": "SHORT", "stop_price": float(lo[m - 1] + 0.1 * atr[k]), "note": "mfvg_s"})
+                out.append({
+                    "entry_idx": k,
+                    "direction": "SHORT",
+                    "stop_price": float(lo[m - 1] + 0.1 * atr[k]),
+                    "note": "mfvg_s",
+                    "features": {"gap_atr": float(g/atr[m]) if np.isfinite(atr[m]) and atr[m]>0 else 0.0, "fill_frac": float(f), "swing_confirm": True},
+                    "score": None
+                })
     return out

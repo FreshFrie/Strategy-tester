@@ -9,9 +9,9 @@ def detect_svwap_sh(arr, day_ctx, params):
     direction = day_ctx["direction"]
 
     n = int(params.get("atr_n", 14))
-    k_hold = int(params.get("k_hold", 3))
+    k_hold = int(params.get("k_hold", 2))
     k_s = int(params.get("k_slope", 10))
-    slope_min = float(params.get("slope_min_atr", 0.1))
+    slope_min = float(params.get("slope_min_atr", 0.05))
     eps = float(params.get("eps_atr", 0.1))
 
     atr = atr_sma(hi, lo, cl, n)
@@ -35,7 +35,14 @@ def detect_svwap_sh(arr, day_ctx, params):
             pulled = np.flatnonzero(mask & (lo[j0:t] <= (avwap[j0:t] + eps * atr[j0:t])))
             if pulled.size == 0:
                 continue
-            out.append({"entry_idx": t, "direction": "LONG", "stop_price": float(cl[t] - 1.25 * atr[t]), "note": "svwap_sh"})
+            out.append({
+                "entry_idx": t,
+                "direction": "LONG",
+                "stop_price": float(cl[t] - 1.25 * atr[t]),
+                "note": "svwap_sh",
+                "features": {"vwap_slope": float((avwap[t]-avwap[t-k_s])/atr[t]) if np.isfinite(atr[t]) and atr[t]>0 else 0.0, "hold_bars": int(k_hold), "recent_pull": True},
+                "score": None
+            })
         else:
             hold = np.all(cl[t - k_hold + 1 : t + 1] < avwap[t - k_hold + 1 : t + 1])
             if not (hold and slope_down):
@@ -45,5 +52,12 @@ def detect_svwap_sh(arr, day_ctx, params):
             pulled = np.flatnonzero(mask & (hi[j0:t] >= (avwap[j0:t] - eps * atr[j0:t])))
             if pulled.size == 0:
                 continue
-            out.append({"entry_idx": t, "direction": "SHORT", "stop_price": float(cl[t] + 1.25 * atr[t]), "note": "svwap_sh"})
+            out.append({
+                "entry_idx": t,
+                "direction": "SHORT",
+                "stop_price": float(cl[t] + 1.25 * atr[t]),
+                "note": "svwap_sh",
+                "features": {"vwap_slope": float((avwap[t-k_s]-avwap[t])/atr[t]) if np.isfinite(atr[t]) and atr[t]>0 else 0.0, "hold_bars": int(k_hold), "recent_pull": True},
+                "score": None
+            })
     return out

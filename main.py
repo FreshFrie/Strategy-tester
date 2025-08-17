@@ -98,6 +98,10 @@ def parse_args():
     parser.add_argument("--max-trades", type=int, default=MAX_TRADES_PER_DAY, help="Maximum trades per day")
     parser.add_argument("--cooldown-min", type=int, default=COOLDOWN_MIN, help="Cooldown minutes between trades")
     parser.add_argument("--no-write", action="store_true", help="Skip writing CSV outputs")
+    parser.add_argument("--early-policy", choices=["skip","bias"], default="skip", help="What to do on early KZ takeout: skip or convert to bias")
+    parser.add_argument("--multi-cluster-mode", choices=["single","multi"], default="single", help="Cluster selection mode: single=top cluster, multi=multiple non-overlapping clusters")
+    parser.add_argument("--dump-day", default="", help="Optional YYYY-MM-DD to dump raw detector signals and clusters for debugging")
+    parser.add_argument("--log-detector-activity", action="store_true", default=True, help="Record per-detector activity and scores per day")
     return parser.parse_args()
 
 def build_asia_report(df: pd.DataFrame, out_path: str, config):
@@ -913,9 +917,58 @@ def determine_trade_entries(asia_info: AsiaKZInfo, takeouts: list[Tuple[str, pd.
         elif takeouts:
             first_takeout_type, _, _ = takeouts[0]
         if first_takeout_type is None:
-            if diag is not None:
-                diag["reason"] = diag.get("reason", []) + ["both_in_kz_no_bias"]
-            return trades  # No bias established; skip entries for the day
+            # Fallback: determine bias from first London breakout past Asia range
+            bias_fallback = None
+            try:
+                # London window indices: e0..e1
+                # breakout = first close above session high for LONG or below session low for SHORT
+                # we'll inspect first breakout candle after Asia KZ end (e0)
+                if e0 is not None and e1 is not None:
+                    # look for first candle that breaks out of pre-London range
+                    m_up = np.flatnonzero(arr.cl[e0:e1] > pre_hi)
+                    m_down = np.flatnonzero(arr.cl[e0:e1] < pre_lo)
+                    if m_up.size and not m_down.size:
+                        bias_fallback = 'LONG'
+                    elif m_down.size and not m_up.size:
+                        bias_fallback = 'SHORT'
+                    elif m_up.size and m_down.size:
+                        # pick earliest breakout
+                        up_idx = e0 + int(m_up[0])
+                        down_idx = e0 + int(m_down[0])
+                        bias_fallback = 'LONG' if up_idx < down_idx else 'SHORT'
+            except Exception:
+                bias_fallback = None
+            # If still none, pick largest impulse in pre-London
+            if bias_fallback is None:
+                try:
+                    seg_lo = max(0, p0)
+                    seg_hi = min(len(arr.cl), p1)
+                    if seg_hi - seg_lo > 3:
+                        rngs = arr.hi[seg_lo:seg_hi] - arr.lo[seg_lo:seg_hi]
+                        idx = int(np.nanargmax(rngs))
+                        cand = seg_lo + idx
+                        # direction by close vs mid of pre-range
+                        mid = 0.5 * (pre_hi + pre_lo)
+                        bias_fallback = 'LONG' if arr.cl[cand] > mid else 'SHORT'
+                except Exception:
+                    bias_fallback = None
+
+            if bias_fallback is None:
+                if diag is not None:
+                    diag["reason"] = diag.get("reason", []) + ["both_in_kz_no_bias"]
+                return trades
+            else:
+                # apply fallback bias
+                first_takeout_type = 'fallback_london_break' if bias_fallback else 'fallback_impulse'
+                if bias_fallback == 'LONG':
+                    target_price = asia_info.kz_high
+                    target_direction = 'LONG'
+                else:
+                    target_price = asia_info.kz_low
+                    target_direction = 'SHORT'
+                if diag is not None:
+                    diag["scenario"] = f"both_in_kz_bias={first_takeout_type}"
+                    diag['bias_source'] = 'fallback_london_break' if first_takeout_type=='fallback_london_break' else 'fallback_impulse'
         if first_takeout_type == "high_takeout":
             target_price = asia_info.kz_low
             target_direction = "SHORT"
@@ -999,63 +1052,143 @@ def determine_trade_entries(asia_info: AsiaKZInfo, takeouts: list[Tuple[str, pd.
     # Ensemble meta-selection
     ens_mode = getattr(config, "ensemble_mode", "off") or "off"
     if ens_mode in ("best", "confluence"):
+        # Run all detectors in parallel (logical parallel: gather outputs from each)
         base_params = {"atr_n": 14, "k_floor": 1.25}
         user_params = getattr(config, "detector_params", {}) or {}
         params = {**base_params, **user_params}
         methods = ["cb_vp", "mfvg_s", "svwap_sh", "iib_c", "wtr"]
         all_cands = []
+        # detector activity tracking
+        log_activity = bool(getattr(config, 'log_detector_activity', True))
+        det_activity = {m: {"raw": 0, "accepted": 0, "raw_scores": [], "acc_scores": []} for m in methods}
+        try:
+            from scoring import score_signal
+        except Exception:
+            score_signal = None
+
         if diag is not None:
             diag["ensemble_mode"] = ens_mode
             diag["detector_raw"] = {m: 0 for m in methods}
             diag["detector_accepted"] = {m: 0 for m in methods}
+
+        # Collect outputs from each detector
         for s in methods:
             try:
                 mod = importlib.import_module(f"detectors.entry_{s}")
                 fn = getattr(mod, f"detect_{s}")
-                out = fn(arr, day_ctx, params)
+                out = fn(arr, day_ctx, params) or []
                 if diag is not None:
-                    diag["detector_raw"][s] = int(len(out) if out is not None else 0)
+                    diag["detector_raw"][s] = int(len(out))
+                if log_activity:
+                    det_activity[s]["raw"] += int(len(out))
                 for c in out:
                     ei = int(c.get("entry_idx", -1))
-                    # Allow both directions if target_direction is not established yet
-                    if e0 <= ei < e1 and (target_direction is None or c.get("direction") == target_direction):
-                        if diag is not None:
-                            diag["detector_accepted"][s] += 1
-                        # Ensure features/score exist
-                        feats = dict(c.get("features", {}))
-                        if not feats:
-                            feats = _meta_features(arr, ei, target_price, target_direction, day_ctx, int(params.get("atr_n",14)))
-                        scr = c.get("score")
-                        if scr is None:
-                            scr = _meta_score_from_features(feats)
-                        c = dict(c)
-                        c["features"] = feats
-                        c["score"] = float(scr)
-                        c.setdefault("note", s)
-                        all_cands.append(c)
+                    # score raw signals for avg_raw even if later rejected
+                    # ensure features for raw score
+                    feats_raw = dict(c.get("features", {}) or {})
+                    if not feats_raw:
+                        feats_raw = _meta_features(arr, max(ei, e0), target_price, target_direction, day_ctx, int(params.get("atr_n", 14)))
+                    scr_raw = c.get("score")
+                    if scr_raw is None:
+                        if score_signal is not None:
+                            scr_raw = score_signal(feats_raw, c.get("note", s))
+                        else:
+                            scr_raw = float(_meta_score_from_features(feats_raw))
+                    if log_activity:
+                        try:
+                            det_activity[s]["raw_scores"].append(float(scr_raw))
+                        except Exception:
+                            pass
+                    # Bound check: must be in London window
+                    if not (e0 <= ei < e1):
+                        continue
+                    # Respect target direction if set
+                    if target_direction is not None and c.get("direction") != target_direction:
+                        continue
+                    # Ensure features exist
+                    feats = dict(c.get("features", {}) or {})
+                    if not feats:
+                        feats = _meta_features(arr, ei, target_price, target_direction, day_ctx, int(params.get("atr_n", 14)))
+                    # Score via detector-provided score or scoring module
+                    scr = c.get("score")
+                    if scr is None:
+                        if score_signal is not None:
+                            scr = score_signal(feats, c.get("note", s))
+                        else:
+                            scr = float(_meta_score_from_features(feats))
+                    c2 = dict(c)
+                    c2["features"] = feats
+                    c2["score"] = float(scr)
+                    c2.setdefault("note", s)
+                    all_cands.append(c2)
+                    if diag is not None:
+                        diag["detector_accepted"][s] += 1
+                    if log_activity:
+                        det_activity[s]["accepted"] += 1
+                        try:
+                            det_activity[s]["acc_scores"].append(float(c2["score"]))
+                        except Exception:
+                            pass
             except Exception:
                 continue
+
         if not all_cands:
             if diag is not None:
                 diag["reason"] = diag.get("reason", []) + ["no_detector_candidates"]
             return trades
-        buckets = _group_by_time_and_direction(all_cands, tol=int(getattr(config, "ensemble_delta", 2)))
-        best_pick = None
+
+        # Cluster by time +/- ensemble_delta bars and direction
+        tol = int(getattr(config, "ensemble_delta", 2))
+        buckets = _group_by_time_and_direction(all_cands, tol=tol)
+
+        # For each bucket compute confluence-boosted score and metadata
+        clusters = []
         for b in buckets:
-            k = len(b.cands)
-            top = max(b.cands, key=lambda x: float(x.get("score", 0.0)))
-            if ens_mode == "confluence" and k >= 2:
+            cands = b.cands
+            # detectors contributing
+            dets = sorted({c.get("note") for c in cands if c.get("note")})
+            base_scores = [float(c.get("score", 0.0)) for c in cands]
+            base_max = max(base_scores) if base_scores else 0.0
+            k = len(cands)
+            # Confluence boost
+            boost = 1.0
+            if k >= 2:
                 boost = min(1.0 + 0.15 * (k - 1), 1.40)
-                top = dict(top)
-                top["score"] = float(top["score"]) * boost
-                top["note"] = f"{top.get('note','')}+conf{k}"
-                top["confluence"] = k
-            if (best_pick is None) or (float(top["score"]) > float(best_pick["score"])):
-                best_pick = top
-        if best_pick is not None:
-            e = int(best_pick["entry_idx"])
-            cand_dir = best_pick.get('direction', target_direction)
-            # Candidate-specific target when bias wasn't set
+            cluster_score = float(min(1.0, base_max * boost))
+            clusters.append({"cands": cands, "score": cluster_score, "confluence": k, "detectors": dets})
+
+        # Selection: single (best cluster) or multi (non-overlapping clusters up to max_trades)
+        mode = getattr(config, "multi_cluster_mode", "single")
+        selected = []
+        if mode == "single":
+            best = max(clusters, key=lambda x: x["score"])
+            selected = [best]
+        else:
+            # multi: sort by score, pick non-overlapping clusters by entry_idx proximity
+            sorted_clusters = sorted(clusters, key=lambda x: x["score"], reverse=True)
+            chosen = []
+            used_idxs = []
+            for cl in sorted_clusters:
+                # Representative index = median candidate index in cluster
+                idxs = sorted([int(c.get("entry_idx", -1)) for c in cl["cands"]])
+                if not idxs:
+                    continue
+                rep = idxs[len(idxs) // 2]
+                # Check overlap: any used index within tol
+                if any(abs(rep - u) <= tol for u in used_idxs):
+                    continue
+                chosen.append(cl)
+                used_idxs.append(rep)
+                if len(chosen) >= int(getattr(config, "max_trades", 1)):
+                    break
+            selected = chosen
+
+        # Emit selected clusters as trade candidates
+        for cl in selected:
+            # choose top candidate inside cluster
+            top = max(cl["cands"], key=lambda x: float(x.get("score", 0.0)))
+            e = int(top["entry_idx"])
+            cand_dir = top.get("direction", target_direction)
             cand_target = float(target_price) if target_price is not None else (
                 float(getattr(asia_info, 'kz_high', np.nan)) if cand_dir == 'LONG' else float(getattr(asia_info, 'kz_low', np.nan))
             )
@@ -1063,15 +1196,28 @@ def determine_trade_entries(asia_info: AsiaKZInfo, takeouts: list[Tuple[str, pd.
                 'entry_time': pd.Timestamp(arr.dt[e]),
                 'entry_price': float(arr.cl[e]),
                 'target_price': cand_target,
-                'stop_price': float(best_pick.get('stop_price')) if best_pick.get('stop_price') is not None else None,
+                'stop_price': float(top.get('stop_price')) if top.get('stop_price') is not None else None,
                 'direction': cand_dir,
-                'scenario': f"ens-{ens_mode}:{best_pick.get('note','')}",
-                'entry_idx': e
+                'scenario': f"ens-cluster:{cl['score']:.2f}",
+                'entry_idx': e,
+                'note': "+".join(cl['detectors']),
+                'score': float(cl['score'])
             })
-            if diag is not None:
-                diag["picked"] = best_pick.get('note','')
-                diag["picked_idx"] = e
-            return trades
+        if diag is not None:
+            diag['clusters'] = len(clusters)
+            diag['picked_clusters'] = len(selected)
+            if log_activity:
+                # summarize averages
+                diag['detector_activity'] = {}
+                for m in methods:
+                    ra = det_activity[m]
+                    avg_raw = (sum(ra['raw_scores'])/len(ra['raw_scores'])) if ra['raw_scores'] else float('nan')
+                    avg_acc = (sum(ra['acc_scores'])/len(ra['acc_scores'])) if ra['acc_scores'] else float('nan')
+                    diag['detector_activity'][m] = {
+                        'raw': ra['raw'], 'accepted': ra['accepted'],
+                        'avg_raw_score': avg_raw, 'avg_acc_score': avg_acc
+                    }
+        return trades
 
     if getattr(config, "entry_strategy", "baseline") != "baseline":
         # Merge default params with any provided detector params
@@ -1347,13 +1493,21 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
         })
         if early:
             days_early_takeout += 1
-            diag["early_skip"] = True
+            early_policy = getattr(config, 'early_policy', 'skip')
+            if early_policy == 'bias' and early_bias:
+                # convert into bias; do not skip the day
+                diag["early_skip"] = False
+                diag["early_bias"] = early_bias or ""
+                diag["bias_source"] = 'early_policy'
+            else:
+                diag["early_skip"] = True
+                diag["early_bias"] = early_bias or ""
+                diag_rows.append(diag)
+                equity_points.append({"date": day_ts, "equity": equity})
+                continue  # Skip day if early takeout occurred
+        else:
+            diag["early_skip"] = False
             diag["early_bias"] = early_bias or ""
-            diag_rows.append(diag)
-            equity_points.append({"date": day_ts, "equity": equity})
-            continue  # Skip day if early takeout occurred
-        diag["early_skip"] = False
-        diag["early_bias"] = early_bias or ""
 
         # Step 3: Get the takeout window (configurable)
         # Already have t0,t1 from iterator
@@ -1381,10 +1535,10 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
         day_trades = 0
         last_exit_time = None
 
-    orient_skips = 0
-    cooldown_skips = 0
-    sizing_skips = 0
-    for trade_setup in potential_trades:
+        orient_skips = 0
+        cooldown_skips = 0
+        sizing_skips = 0
+        for trade_setup in potential_trades:
             # Check daily trade limit
             if day_trades >= config.max_trades:
                 break
@@ -1642,8 +1796,28 @@ def backtest(df: pd.DataFrame, config) -> Tuple[pd.DataFrame, pd.DataFrame]:
                             for k2, v2 in row[key].items():
                                 row[f"{key}.{k2}"] = v2
                             del row[key]
+                    if isinstance(row.get('detector_activity'), dict):
+                        da = row.pop('detector_activity')
+                        for det, stats in da.items():
+                            row[f"detector_{det}_raw"] = stats.get('raw', 0)
+                            row[f"detector_{det}_acc"] = stats.get('accepted', 0)
+                            row[f"detector_{det}_avg_raw"] = stats.get('avg_raw_score', float('nan'))
+                            row[f"detector_{det}_avg_acc"] = stats.get('avg_acc_score', float('nan'))
                     norm.append(row)
                 pd.DataFrame(norm).to_csv(os.path.join(out_dir, 'trade_diagnostics.csv'), index=False)
+                # Optional separate detector activity file
+                try:
+                    det_rows = []
+                    for row in norm:
+                        dr = {"day": row.get("day")}
+                        for k, v in row.items():
+                            if isinstance(k, str) and k.startswith("detector_"):
+                                dr[k] = v
+                        det_rows.append(dr)
+                    if det_rows:
+                        pd.DataFrame(det_rows).to_csv(os.path.join(out_dir, 'detector_activity.csv'), index=False)
+                except Exception:
+                    pass
         except Exception:
             pass
 

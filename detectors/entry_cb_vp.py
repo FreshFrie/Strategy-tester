@@ -21,7 +21,7 @@ def detect_cb_vp(arr, day_ctx, params):
     if not np.isfinite(pre_atr_mean) or pre_atr_mean <= 0:
         return []
 
-    alpha_max = float(params.get("alpha_prelon_max", 0.4))
+    alpha_max = float(params.get("alpha_prelon_max", 0.6))
     comp = (pre_hi - pre_lo) / pre_atr_mean if pre_atr_mean > 0 else np.inf
     if not (comp <= alpha_max):
         return []
@@ -29,7 +29,7 @@ def detect_cb_vp(arr, day_ctx, params):
     beta = float(params.get("beta", 0.8))
     gamma = float(params.get("gamma", 0.7))
     eps = float(params.get("eps_atr", 0.1))
-    R_retest = int(params.get("R_retest", 3))
+    R_retest = int(params.get("R_retest", 5))
 
     br = body_ratio(op, hi, lo, cl)
     out = []
@@ -52,7 +52,7 @@ def detect_cb_vp(arr, day_ctx, params):
                 continue
             j = j0 + int(touched[0])
             if cl[j] > max(cl[j - 1], hi[j - 1]):
-                out.append({"entry_idx": j, "direction": "LONG", "stop_price": None, "note": "cb_vp"})
+                out.append({"entry_idx": j, "direction": "LONG", "stop_price": None, "note": "cb_vp", "features": {"comp_ratio": float(comp), "atr_mult": float((hi[i]-lo[i])/pre_atr_mean if pre_atr_mean>0 else 0.0), "retest_distance": float((cl[j]-pre_hi)/pre_atr_mean if pre_atr_mean>0 else 0.0)}, "score": None})
         else:
             if cl[i] >= pre_lo:
                 continue
@@ -62,7 +62,7 @@ def detect_cb_vp(arr, day_ctx, params):
                 continue
             j = j0 + int(touched[0])
             if cl[j] < min(cl[j - 1], lo[j - 1]):
-                out.append({"entry_idx": j, "direction": "SHORT", "stop_price": None, "note": "cb_vp"})
+                out.append({"entry_idx": j, "direction": "SHORT", "stop_price": None, "note": "cb_vp", "features": {"comp_ratio": float(comp), "atr_mult": float((hi[i]-lo[i])/pre_atr_mean if pre_atr_mean>0 else 0.0), "retest_distance": float((pre_lo-cl[j])/pre_atr_mean if pre_atr_mean>0 else 0.0)}, "score": None})
 
     # Stop: max(structural, ATR floor) per spec (min for LONG, max for SHORT yields farther stop)
     k_floor = float(params.get("k_floor", 1.25))

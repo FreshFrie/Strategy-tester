@@ -22,9 +22,23 @@ def detect_iib_c(arr, day_ctx, params):
         if hi[i + 1] <= hi[i] and lo[i + 1] >= lo[i]:
             # Confirm with next bar (i+2) breaking impulse extreme by a small ATR buffer
             j = i + 2
-            thr = 0.05 * atr[i]
+            thr = 0.03 * atr[i]
             if direction == "LONG" and hi[j] >= hi[i] + thr and cl[j] >= hi[i]:
-                out.append({"entry_idx": j, "direction": "LONG", "stop_price": float(lo[i] - 0.1 * atr[i]), "note": "iib_c"})
+                out.append({
+                    "entry_idx": j,
+                    "direction": "LONG",
+                    "stop_price": float(lo[i] - 0.1 * atr[i]),
+                    "note": "iib_c",
+                    "features": {"impulse_atr": float((hi[i]-lo[i])/atr[i]) if np.isfinite(atr[i]) and atr[i]>0 else 0.0, "body_ratio": float((cl[i]-op[i])/(hi[i]-lo[i]) if (hi[i]-lo[i])>0 else 0.0), "confirm_break": True},
+                    "score": None
+                })
             elif direction == "SHORT" and lo[j] <= lo[i] - thr and cl[j] <= lo[i]:
-                out.append({"entry_idx": j, "direction": "SHORT", "stop_price": float(hi[i] + 0.1 * atr[i]), "note": "iib_c"})
+                out.append({
+                    "entry_idx": j,
+                    "direction": "SHORT",
+                    "stop_price": float(hi[i] + 0.1 * atr[i]),
+                    "note": "iib_c",
+                    "features": {"impulse_atr": float((hi[i]-lo[i])/atr[i]) if np.isfinite(atr[i]) and atr[i]>0 else 0.0, "body_ratio": float((op[i]-cl[i])/(hi[i]-lo[i]) if (hi[i]-lo[i])>0 else 0.0), "confirm_break": True},
+                    "score": None
+                })
     return out
